@@ -9,7 +9,7 @@ use pdf_inspector::{
     collect_text_in_region_in_frame, extract_text_with_positions_and_rotations_mem, PageRotation,
 };
 use pdf_inspector::{
-    detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
+    detect_pdf_mem, detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
     process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
@@ -18,7 +18,8 @@ use pdf_inspector::{
 };
 use pdf_inspector::{
     detect_pdf_type_mem, detect_pdf_type_mem_with_config, PageOcrReasons,
-    OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_SCANNED, OCR_REASON_VECTOR_TEXT,
+    OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_NO_TEXT, OCR_REASON_SCANNED,
+    OCR_REASON_SUSPECTED_GARBLED_TEXT, OCR_REASON_VECTOR_TEXT,
 };
 use pdf_inspector::{
     extract_tables_in_regions_mem_in_frame, extract_text_in_regions_mem_in_frame,
@@ -2927,6 +2928,152 @@ fn test_invisible_text_layer_under_covering_image_needs_ocr() {
             "mode {mode}"
         );
     }
+}
+
+/// A page with no text and no image needs OCR as `no_text` in per-page
+/// extraction, as classification already says.
+#[test]
+fn test_blank_page_gets_no_text_reason_per_page() {
+    let buf = make_text_pdf("", "0 0 612 792");
+    let no_text = vec![PageOcrReasons {
+        page: 1,
+        reasons: vec![OCR_REASON_NO_TEXT.to_string()],
+    }];
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_NO_TEXT)
+    );
+    assert_eq!(pages.pages_needing_ocr, vec![1]);
+    assert_eq!(pages.ocr_reasons_by_page, no_text);
+
+    let detected = detect_pdf_mem(&buf).unwrap();
+    assert_eq!(detected.ocr_reasons_by_page, no_text);
+}
+
+/// A page with an image and no text is not `no_text`.
+#[test]
+fn test_image_only_page_does_not_get_no_text_reason_per_page() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: None,
+        layer_glyphs: 0,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_ne!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_NO_TEXT)
+    );
+    assert!(pages
+        .ocr_reasons_by_page
+        .iter()
+        .flat_map(|page| &page.reasons)
+        .all(|reason| reason != OCR_REASON_NO_TEXT));
+}
+
+/// A page of outlined glyphs, with no text and no image, keeps
+/// `vector_text` alone: `no_text` applies only when no other reason does.
+#[test]
+fn test_vector_text_page_does_not_also_get_no_text_reason_per_page() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        layer_mode: None,
+        vector_paths: 300,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let vector_text = vec![PageOcrReasons {
+        page: 1,
+        reasons: vec![OCR_REASON_VECTOR_TEXT.to_string()],
+    }];
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(pages.ocr_reasons_by_page, vector_text);
+
+    let detected = detect_pdf_mem(&buf).unwrap();
+    assert_eq!(detected.ocr_reasons_by_page, vector_text);
+}
+
+/// A page that shows only spaces through a font with no Unicode mapping
+/// is `suspected_garbled_text` to classification, so per-page extraction
+/// does not call it `no_text`.
+#[test]
+fn test_unmapped_font_page_does_not_get_no_text_reason_per_page() {
+    let font = "<< /Type /Font /Subtype /Type0 /BaseFont /AAAAAA+Glyphs /Encoding /Identity-H \
+                /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /AAAAAA+Glyphs \
+                /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>] >>";
+    let content = "BT /F1 12 Tf 72 700 Td <2020> Tj ET";
+    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, None, None, font);
+
+    let detected = detect_pdf_mem(&buf).unwrap();
+    assert_eq!(
+        detected.ocr_reasons_by_page,
+        vec![PageOcrReasons {
+            page: 1,
+            reasons: vec![OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()],
+        }]
+    );
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_ne!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_NO_TEXT)
+    );
+}
+
+/// A page whose only text is a filled form field keeps that text and is
+/// not `no_text`, although its content stream shows nothing.
+#[test]
+fn test_form_field_only_page_keeps_its_text_per_page() {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let content_id = doc.add_object(Stream::new(dictionary! {}, Vec::new()));
+    let widget_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Widget",
+        "FT" => "Tx",
+        "T" => Object::string_literal("name"),
+        "V" => Object::string_literal("Jane Doe"),
+        "Rect" => vec![100.into(), 700.into(), 300.into(), 720.into()],
+    });
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content_id,
+        "Annots" => vec![widget_id.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "AcroForm" => dictionary! {
+            "Fields" => vec![widget_id.into()],
+        },
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].markdown.contains("Jane Doe"));
+    assert!(!pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages[0].ocr_reason, None);
+    assert!(pages.pages_needing_ocr.is_empty());
+    assert!(pages.ocr_reasons_by_page.is_empty());
 }
 
 /// The same layer painted (render mode 0) is a text page over an image,

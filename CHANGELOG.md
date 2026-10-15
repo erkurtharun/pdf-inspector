@@ -25,6 +25,10 @@ version and date. Earlier releases are described in their
   advances reads as a space. Word justifies lines with Arial's en and em
   spaces, which came out as U+FFFD between every word
   (`Proposer�Legal�Name`) and sent the pages to OCR as garbled text.
+- `extract_pages_markdown_mem` gives the `no_text` reason, by
+  classification's rule (no extractable text, no image, no other reason),
+  to a page whose Markdown is empty. Such a page needed OCR with no reason
+  given. It still needs OCR.
 
 ## [1.25.2] - 2026-09-28
 

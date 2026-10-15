@@ -765,7 +765,7 @@ fn extract_pages_markdown_mem_impl(
         // these pages to OCR; mirror that here too. And a page whose every
         // text-showing operator is invisible under a covering image: the
         // text layer it extracts describes the raster rather than being
-        // the page's content. All three signals share one
+        // the page's content. All these signals, and `no_text`, share one
         // analyze_page_content pass — see page_ocr_signals's doc comment.
         let signals = lopdf_pages
             .get(&page_1idx)
@@ -829,6 +829,10 @@ fn extract_pages_markdown_mem_impl(
         }
         if has_vector_text {
             add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_VECTOR_TEXT);
+        }
+        if signals.no_text && md.trim().is_empty() && !ocr_reasons_by_page.contains_key(&page_1idx)
+        {
+            add_ocr_reason(&mut ocr_reasons_by_page, page_1idx, OCR_REASON_NO_TEXT);
         }
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 

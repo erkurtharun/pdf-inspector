@@ -685,7 +685,8 @@ struct PageAnalysis {
 /// backs it or `no_text` when nothing does. `extract_pages_markdown_mem`
 /// puts `invisible_text_layer` first as well; the reasons after it keep
 /// each surface's own order (there, `scanned` can stand beside the font
-/// and path reasons, which here pre-empt it).
+/// and path reasons, which here pre-empt it), and it gives `no_text` by
+/// this rule to a page with no other reason and no Markdown.
 fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if a.has_invisible_text_layer {
@@ -2198,9 +2199,9 @@ pub(crate) fn analyze_page_images(doc: &Document, page_id: ObjectId) -> (bool, u
     (has_images, total_area, has_template_image)
 }
 
-/// Computes `template_image_needs_ocr`, `has_vector_text` and
-/// `has_invisible_text_layer` (see [`PageOcrSignals`]) for a page from a
-/// single shared `analyze_page_content` pass — that call
+/// Computes `template_image_needs_ocr`, `has_vector_text`,
+/// `has_invisible_text_layer` and `no_text` (see [`PageOcrSignals`]) for a
+/// page from a single shared `analyze_page_content` pass — that call
 /// decompresses and scans every content stream (page + XObjects) plus
 /// image coverage, so `extract_pages_markdown_mem` must not invoke it
 /// twice per page (once per signal) the way `detect_from_document` avoids
@@ -2263,6 +2264,7 @@ pub(crate) fn page_ocr_signals(doc: &Document, page_id: ObjectId) -> PageOcrSign
         template_image_needs_ocr: needs_ocr_for_template_image,
         has_vector_text: analysis.has_vector_text,
         has_invisible_text_layer: analysis.has_invisible_text_layer,
+        no_text: page_ocr_reasons(&analysis) == [crate::OCR_REASON_NO_TEXT],
     }
 }
 
@@ -2278,6 +2280,8 @@ pub(crate) struct PageOcrSignals {
     /// Every text-showing operator on the page is invisible while an image
     /// covers the page.
     pub(crate) has_invisible_text_layer: bool,
+    /// `page_ocr_reasons` gives the page `no_text` and no other reason.
+    pub(crate) no_text: bool,
 }
 
 /// Recursively collect image dimensions from XObject resources,
