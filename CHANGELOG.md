@@ -23,6 +23,14 @@ version and date. Earlier releases are described in their
   stays in its table, and a running header or footer that lines up like a
   grid is not read as a table. `extract_pages_markdown_mem` and the OCR
   pipeline are unchanged.
+- Rust `extract_pages_markdown_and_document_mem_with_options` (the Python,
+  Node and WebAssembly bindings do not expose it):
+  `extract_pages_markdown_mem_with_options` that also returns the
+  `lopdf::Document` the extraction read, so a caller rendering the extracted
+  pages draws them from the document as the loader left it: leading bytes
+  dropped, the container and form boxes repaired, and an encrypted document's
+  objects decrypted with the empty password, so that it writes out
+  unprotected.
 
 ### Fixed
 

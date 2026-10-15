@@ -10,10 +10,10 @@ use pdf_inspector::{
 };
 use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
-    extract_pages_markdown_mem, extract_pages_markdown_mem_with_options,
-    extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
-    extract_text_with_positions, extract_text_with_positions_mem, process_pdf_mem,
-    process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
+    extract_pages_markdown_and_document_mem_with_options, extract_pages_markdown_mem,
+    extract_pages_markdown_mem_with_options, extract_tables_in_regions_mem, extract_text,
+    extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
+    process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
     PdfType, TextItem,
 };
@@ -9333,6 +9333,85 @@ fn test_widen_degenerate_form_bboxes_mem_repairs_only_zero_area_boxes() {
     assert!(widen_degenerate_form_bboxes_mem(&make_minimal_text_pdf())
         .unwrap()
         .is_none());
+}
+
+/// Per-page extraction hands back the document it read, with the
+/// zero-area form box widened as the loader left it, so a renderer drawing
+/// the extracted pages sees the content the extraction did.
+#[test]
+fn test_per_page_extraction_returns_the_document_with_repaired_forms() {
+    let buf = make_pdf_with_form(FORM_PAGE_CONTENT, "0 0 0 0", FORM_TEXT_CONTENT);
+    let (result, doc) = extract_pages_markdown_and_document_mem_with_options(
+        &buf,
+        None,
+        MarkdownOptions::default(),
+    )
+    .unwrap();
+    assert!(result.pages[0].markdown.contains("Drawn through the form"));
+    assert_eq!(doc.get_pages().len(), result.pages.len());
+
+    let bbox: Vec<i64> = doc
+        .objects
+        .values()
+        .find_map(|object| match object {
+            lopdf::Object::Stream(stream)
+                if stream
+                    .dict
+                    .get(b"Subtype")
+                    .ok()
+                    .and_then(|s| s.as_name().ok())
+                    == Some(b"Form") =>
+            {
+                stream.dict.get(b"BBox").ok()
+            }
+            _ => None,
+        })
+        .and_then(|bbox| bbox.as_array().ok())
+        .expect("the document holds the form")
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    assert_eq!(bbox, vec![-1_000_000, -1_000_000, 1_000_000, 1_000_000]);
+}
+
+/// A document encrypted with an empty user password comes back from
+/// per-page extraction decrypted, as lopdf leaves it: the `/Encrypt` entry
+/// removed and the encryption state kept.
+#[test]
+fn test_per_page_extraction_returns_the_document_decrypted() {
+    let content = "BT /F1 12 Tf 72 700 Td (Behind an owner password) Tj ET";
+    let mut doc = lopdf::Document::load_mem(&make_text_pdf(content, "0 0 612 792")).unwrap();
+    let file_id = lopdf::Object::string_literal(vec![0x42u8; 16]);
+    doc.trailer
+        .set("ID", lopdf::Object::Array(vec![file_id.clone(), file_id]));
+    let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+        document: &doc,
+        owner_password: "owner",
+        user_password: "",
+        key_length: 128,
+        permissions: lopdf::Permissions::all(),
+    })
+    .unwrap();
+    doc.encrypt(&state).unwrap();
+    let mut encrypted = Vec::new();
+    doc.save_to(&mut encrypted).unwrap();
+
+    let (result, doc) = extract_pages_markdown_and_document_mem_with_options(
+        &encrypted,
+        None,
+        MarkdownOptions::default(),
+    )
+    .unwrap();
+    assert!(result.pages[0]
+        .markdown
+        .contains("Behind an owner password"));
+    let page_id = doc.get_pages()[&1];
+    assert_eq!(
+        doc.get_page_content(page_id),
+        format!("{content}\n").into_bytes()
+    );
+    assert!(doc.trailer.get(b"Encrypt").is_err());
+    assert!(doc.encryption_state.is_some());
 }
 
 /// A minimal TrueType font program — `head`, `hhea`, `maxp`, `hmtx`, `loca`

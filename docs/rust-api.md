@@ -558,6 +558,7 @@ read inheritably and snapped to a right angle (`-90` is `270`, `450` is `90`).
 | `extract_pages_markdown(path, pages)` | Per-page Markdown + layout metadata (file) |
 | `extract_pages_markdown_mem(bytes, pages)` | Per-page Markdown from bytes |
 | `extract_pages_markdown_mem_with_options(bytes, pages, options)` | Rust only (not in the Python, Node.js or WebAssembly bindings). The same with a `MarkdownOptions`; `strip_headers_footers` strips from each page the running headers and footers `process_pdf_mem` strips from the whole document |
+| `extract_pages_markdown_and_document_mem_with_options(bytes, pages, options)` | Rust only (not in the Python, Node.js or WebAssembly bindings). The same, together with the `lopdf::Document` the extraction read — leading bytes dropped, the container and form boxes repaired, and an encrypted document decrypted with the empty password, so that it writes out unprotected — for rendering the same pages |
 | `extract_structure_elements(path, pages)` | Structure-tree elements from tagged PDFs (page, mcid, role) |
 | `extract_structure_elements_mem(bytes, pages)` | Structure-tree elements from bytes |
 | `widen_degenerate_form_bboxes_mem(bytes)` | Rust only (not in the Python, Node.js or WebAssembly bindings). The document re-serialized with the `/BBox` of its Form XObjects repaired — a zero-area box widened, numerals too large for any parser saturated — for rendering elsewhere; `None` when no form needs it and for an encrypted document, whose protection a plain serialization would drop |

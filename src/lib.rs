@@ -593,7 +593,7 @@ pub fn extract_pages_markdown_mem(
         false,
         false,
     )
-    .map(|extraction| extraction.result)
+    .map(|(extraction, _)| extraction.result)
 }
 
 /// [`extract_pages_markdown_mem`] with the given Markdown options.
@@ -619,6 +619,31 @@ pub fn extract_pages_markdown_mem_with_options(
     pages: Option<&[u32]>,
     options: MarkdownOptions,
 ) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_and_document_mem_with_options(buffer, pages, options)
+        .map(|(result, _)| result)
+}
+
+/// [`extract_pages_markdown_mem_with_options`], also returning the
+/// `lopdf::Document` the extraction read, for a caller that renders the
+/// pages it extracted and has them drawn from the same document.
+///
+/// The document is as the loader left it: bytes before the `%PDF-` header
+/// dropped, the container repaired when it did not parse as written, and
+/// bare structure element names fixed; `/BBox` numerals too large for any
+/// parser saturated and zero-area form boxes widened (see
+/// [`widen_degenerate_form_bboxes_mem`]); and an encrypted document's
+/// objects decrypted with the empty password. lopdf removes the `/Encrypt`
+/// entry as it decrypts and keeps the `encryption_state` it read, so the
+/// document writes out unprotected. It holds every page of the PDF: the
+/// [`PageMarkdown`] whose `page` is `n` comes from its page `n + 1` when
+/// the PDF has that page.
+///
+/// Rust only (not in the Python, Node.js or WebAssembly bindings).
+pub fn extract_pages_markdown_and_document_mem_with_options(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    options: MarkdownOptions,
+) -> Result<(PagesExtractionResult, Document), PdfError> {
     extract_pages_markdown_mem_impl(
         buffer,
         pages,
@@ -632,7 +657,7 @@ pub fn extract_pages_markdown_mem_with_options(
         false,
         false,
     )
-    .map(|extraction| extraction.result)
+    .map(|(extraction, doc)| (extraction.result, doc))
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -659,6 +684,7 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         true,
         render_repairs,
     )
+    .map(|(extraction, _)| extraction)
 }
 
 fn extract_pages_markdown_mem_impl(
@@ -669,7 +695,7 @@ fn extract_pages_markdown_mem_impl(
     header_footer_stripping: HeaderFooterStripping,
     preserve_ocr_candidates: bool,
     render_repairs: bool,
-) -> Result<InternalPagesExtraction, PdfError> {
+) -> Result<(InternalPagesExtraction, Document), PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -955,7 +981,7 @@ fn extract_pages_markdown_mem_impl(
         });
     }
 
-    Ok(InternalPagesExtraction {
+    let extraction = InternalPagesExtraction {
         result: PagesExtractionResult {
             pages: results,
             pages_with_tables: complexity.pages_with_tables,
@@ -985,7 +1011,8 @@ fn extract_pages_markdown_mem_impl(
         } else {
             None
         },
-    })
+    };
+    Ok((extraction, doc))
 }
 
 /// Image regions large enough to plausibly contain rasterized document
