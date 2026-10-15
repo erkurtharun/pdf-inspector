@@ -10,9 +10,10 @@ use pdf_inspector::{
 };
 use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
-    extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
-    extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
-    process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
+    extract_pages_markdown_mem, extract_pages_markdown_mem_with_options,
+    extract_tables_in_regions_mem, extract_text, extract_text_in_regions_mem,
+    extract_text_with_positions, extract_text_with_positions_mem, process_pdf_mem,
+    process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
     PdfType, TextItem,
 };
@@ -5235,6 +5236,395 @@ fn test_extract_pages_markdown_uses_document_wide_folio_context() {
             index + 1,
             page.markdown
         );
+    }
+}
+
+/// US Letter pages in Helvetica, each drawn from `(size, x, y, text)` lines.
+fn make_helvetica_lines_pdf(pages: &[Vec<(i64, i64, i64, String)>]) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for lines in pages {
+        let mut operations = Vec::new();
+        for (size, x, y, text) in lines {
+            operations.extend([
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), (*size).into()]),
+                Operation::new("Td", vec![(*x).into(), (*y).into()]),
+                Operation::new("Tj", vec![Object::string_literal(text.as_str())]),
+                Operation::new("ET", vec![]),
+            ]);
+        }
+        let content = Content { operations }.encode().unwrap();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(page_id.into());
+    }
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Count" => kids.len() as i64,
+            "Kids" => kids,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Three pages that open on the same running header, with a 20 pt title
+/// below it on the first page and twelve body lines on each.
+fn make_running_header_pdf() -> Vec<u8> {
+    let pages: Vec<_> = ["North", "South", "East"]
+        .into_iter()
+        .enumerate()
+        .map(|(page, region)| {
+            let mut lines = vec![(11, 72, 760, "Quarterly Research Bulletin".to_string())];
+            if page == 0 {
+                lines.push((20, 72, 720, "Survey of Regional Libraries".to_string()));
+            }
+            for row in 1..=12 {
+                let text = format!("{region} finding {row} describes a measured outcome.");
+                lines.push((11, 72, 690 - row * 18, text));
+            }
+            lines
+        })
+        .collect();
+    make_helvetica_lines_pdf(&pages)
+}
+
+/// A running header is kept on the first page and stripped from the later
+/// ones, judged over the whole document even when one later page is asked
+/// for; `strip_headers_footers: false` and `extract_pages_markdown_mem` keep
+/// it everywhere.
+#[test]
+fn test_extract_pages_markdown_with_options_strips_running_headers() {
+    let pdf = make_running_header_pdf();
+    let header = "Quarterly Research Bulletin";
+
+    let stripped =
+        extract_pages_markdown_mem_with_options(&pdf, None, MarkdownOptions::default()).unwrap();
+    assert!(stripped.pages[0].markdown.contains(header));
+    for page in &stripped.pages[1..] {
+        assert!(!page.markdown.contains(header), "{}", page.markdown);
+        assert!(page.markdown.contains("finding 12 describes"));
+    }
+
+    let last =
+        extract_pages_markdown_mem_with_options(&pdf, Some(&[2]), MarkdownOptions::default())
+            .unwrap();
+    assert_eq!(last.pages.len(), 1);
+    assert!(!last.pages[0].markdown.contains(header));
+
+    let kept = MarkdownOptions {
+        strip_headers_footers: false,
+        ..MarkdownOptions::default()
+    };
+    let kept = extract_pages_markdown_mem_with_options(&pdf, None, kept).unwrap();
+    let plain = extract_pages_markdown_mem(&pdf, None).unwrap();
+    for page in kept.pages.iter().chain(&plain.pages) {
+        assert!(page.markdown.contains(header), "{}", page.markdown);
+    }
+}
+
+/// The Markdown options given reach every page: header detection marks the
+/// first page's title as a heading only while it is on.
+#[test]
+fn test_extract_pages_markdown_with_options_applies_markdown_options() {
+    let pdf = make_running_header_pdf();
+    let title = "Survey of Regional Libraries";
+    let has_heading = |markdown: &str| {
+        markdown
+            .lines()
+            .any(|line| line.starts_with('#') && line.ends_with(title))
+    };
+
+    let detected =
+        extract_pages_markdown_mem_with_options(&pdf, Some(&[0]), MarkdownOptions::default())
+            .unwrap();
+    assert!(has_heading(&detected.pages[0].markdown));
+
+    let options = MarkdownOptions {
+        detect_headers: false,
+        ..MarkdownOptions::default()
+    };
+    let plain = extract_pages_markdown_mem_with_options(&pdf, Some(&[0]), options).unwrap();
+    assert!(!has_heading(&plain.pages[0].markdown));
+    assert!(plain.pages[0].markdown.contains(title));
+}
+
+/// Three pages under the same running header, each with a table whose
+/// header row repeats near the top edge, followed by body lines.
+fn make_repeated_table_header_pdf() -> Vec<u8> {
+    let columns = [72, 200, 330, 460];
+    let header = ["Region", "Quarter", "Revenue", "Margin"];
+    let pages: Vec<_> = ["North", "South", "East"]
+        .into_iter()
+        .enumerate()
+        .map(|(page, region)| {
+            let page = page as i64;
+            let mut lines = vec![(10, 72, 760, "Quarterly Research Bulletin".to_string())];
+            for (x, cell) in columns.iter().zip(header) {
+                lines.push((10, *x, 720, cell.to_string()));
+            }
+            for row in 0..6 {
+                let cells = [
+                    format!("Area {}", page * 6 + row + 1),
+                    format!("Q{}", row % 4 + 1),
+                    format!("{}", 1000 + page * 100 + row * 7),
+                    format!("{}.{}", 10 + row, page),
+                ];
+                for (x, cell) in columns.iter().zip(cells) {
+                    lines.push((10, *x, 700 - row * 16, cell));
+                }
+            }
+            for line in 1..=8 {
+                let body = format!("{region} note {line} explains the reported figures.");
+                lines.push((10, 72, 560 - line * 16, body));
+            }
+            lines
+        })
+        .collect();
+    make_helvetica_lines_pdf(&pages)
+}
+
+/// A table header row repeated near the top of every page stays in each
+/// page's table, as in `process_pdf_mem`, while the running header above it
+/// is stripped.
+#[test]
+fn test_extract_pages_markdown_with_options_keeps_repeated_table_headers() {
+    let pdf = make_repeated_table_header_pdf();
+    let header_rows = |markdown: &str| {
+        markdown
+            .lines()
+            .filter(|line| line.starts_with("|Region|"))
+            .count()
+    };
+
+    let whole = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert_eq!(header_rows(&whole), 3, "{whole}");
+
+    let result =
+        extract_pages_markdown_mem_with_options(&pdf, None, MarkdownOptions::default()).unwrap();
+    for (index, page) in result.pages.iter().enumerate() {
+        let markdown = &page.markdown;
+        assert_eq!(header_rows(markdown), 1, "{markdown}");
+        assert!(markdown.contains("note 8 explains"), "{markdown}");
+        let running = markdown.contains("Quarterly Research Bulletin");
+        assert_eq!(running, index == 0, "{markdown}");
+    }
+}
+
+/// Four pages of body text over the same three-row navigation footer, whose
+/// words line up in four columns.
+fn make_running_nav_footer_pdf() -> Vec<u8> {
+    let columns = [72, 200, 330, 460];
+    let footer: [(i64, [&str; 4]); 3] = [
+        (92, ["Home", "About", "Research", "Contact"]),
+        (80, ["News", "Events", "People", "Archive"]),
+        (68, ["Jobs", "Press", "Library", "Support"]),
+    ];
+    let pages: Vec<_> = ["North", "South", "East", "West"]
+        .into_iter()
+        .map(|region| {
+            let mut lines: Vec<_> = (1..=14)
+                .map(|line| {
+                    let body = format!("{region} paragraph {line} reports a further result.");
+                    (11, 72, 720 - line * 18, body)
+                })
+                .collect();
+            for (y, words) in footer {
+                for (x, word) in columns.iter().zip(words) {
+                    lines.push((9, *x, y, word.to_string()));
+                }
+            }
+            lines
+        })
+        .collect();
+    make_helvetica_lines_pdf(&pages)
+}
+
+/// A running footer that lines up like a grid is page furniture, not a
+/// table: it is never rendered as one, and it is stripped after the first
+/// page.
+#[test]
+fn test_extract_pages_markdown_with_options_does_not_grid_running_footer() {
+    let pdf = make_running_nav_footer_pdf();
+
+    let whole = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert!(!whole.contains("|Home|"), "{whole}");
+
+    let result =
+        extract_pages_markdown_mem_with_options(&pdf, None, MarkdownOptions::default()).unwrap();
+    for (index, page) in result.pages.iter().enumerate() {
+        let markdown = &page.markdown;
+        assert!(!markdown.contains("|Home|"), "{markdown}");
+        assert!(markdown.contains("paragraph 14 reports"), "{markdown}");
+        if index > 0 {
+            assert!(!markdown.contains("Archive"), "{markdown}");
+        }
+    }
+}
+
+/// One page whose small running header sits just above a table, followed
+/// by body lines.
+fn make_header_above_table_pdf() -> Vec<u8> {
+    let columns = [72, 200, 330, 460];
+    let header = ["Region", "Quarter", "Revenue", "Margin"];
+    let mut lines = vec![(8, 72, 760, "Regional Library Annual Report".to_string())];
+    for (x, cell) in columns.iter().zip(header) {
+        lines.push((10, *x, 744, cell.to_string()));
+    }
+    for row in 0..6 {
+        let cells = [
+            format!("Area {}", row + 1),
+            format!("Q{}", row % 4 + 1),
+            format!("{}", 1000 + row * 7),
+            format!("{}.5", 10 + row),
+        ];
+        for (x, cell) in columns.iter().zip(cells) {
+            lines.push((10, *x, 728 - row * 16, cell));
+        }
+    }
+    for line in 1..=10 {
+        let body = format!("Note {line} explains the reported figures.");
+        lines.push((10, 72, 600 - line * 16, body));
+    }
+    make_helvetica_lines_pdf(&[lines])
+}
+
+/// In a short document, a small header just above a table is judged against
+/// the lines outside the table, as in `process_pdf_mem`, and stripped.
+#[test]
+fn test_extract_pages_markdown_with_options_strips_header_above_table() {
+    let pdf = make_header_above_table_pdf();
+    let header = "Regional Library Annual Report";
+
+    let whole = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert!(!whole.contains(header), "{whole}");
+    assert!(whole.contains("|Region|"), "{whole}");
+
+    let result =
+        extract_pages_markdown_mem_with_options(&pdf, None, MarkdownOptions::default()).unwrap();
+    let markdown = &result.pages[0].markdown;
+    assert!(!markdown.contains(header), "{markdown}");
+    assert!(markdown.contains("|Region|"), "{markdown}");
+    assert!(markdown.contains("Note 10 explains"), "{markdown}");
+}
+
+/// One page under two small lines at the top edge, each set apart from the
+/// text below it, over ten body lines.
+fn make_stacked_edge_lines_pdf() -> Vec<u8> {
+    let mut lines = vec![
+        (8, 72, 760, "Regional Library Annual Report".to_string()),
+        (8, 72, 728, "Prepared for the Board of Trustees".to_string()),
+    ];
+    for line in 0..10 {
+        let body = format!("Note {} explains the reported figures.", line + 1);
+        lines.push((10, 72, 674 - line * 16, body));
+    }
+    make_helvetica_lines_pdf(&[lines])
+}
+
+/// A short document's edge lines are judged once, as in `process_pdf_mem`:
+/// the outer line is stripped, and the line it leaves at the edge is kept.
+#[test]
+fn test_extract_pages_markdown_with_options_strips_short_document_edge_once() {
+    let pdf = make_stacked_edge_lines_pdf();
+    let outer = "Regional Library Annual Report";
+    let inner = "Prepared for the Board of Trustees";
+
+    let whole = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert!(!whole.contains(outer), "{whole}");
+    assert!(whole.contains(inner), "{whole}");
+
+    let result =
+        extract_pages_markdown_mem_with_options(&pdf, None, MarkdownOptions::default()).unwrap();
+    let markdown = &result.pages[0].markdown;
+    assert!(!markdown.contains(outer), "{markdown}");
+    assert!(markdown.contains(inner), "{markdown}");
+}
+
+/// Four pages opening on the same row of column titles: a table's header
+/// row on the first page, and a plain line above body text on the others.
+fn make_table_header_then_plain_row_pdf() -> Vec<u8> {
+    let columns = [72, 200, 330, 460];
+    let header = ["Region", "Quarter", "Revenue", "Margin"];
+    let pages: Vec<_> = ["North", "South", "East", "West"]
+        .into_iter()
+        .enumerate()
+        .map(|(page, region)| {
+            let mut lines: Vec<_> = columns
+                .iter()
+                .zip(header)
+                .map(|(x, cell)| (10, *x, 740, cell.to_string()))
+                .collect();
+            if page == 0 {
+                for row in 0..6 {
+                    let cells = [
+                        format!("Area {}", row + 1),
+                        format!("Q{}", row % 4 + 1),
+                        format!("{}", 1000 + row * 7),
+                        format!("{}.5", 10 + row),
+                    ];
+                    for (x, cell) in columns.iter().zip(cells) {
+                        lines.push((10, *x, 724 - row * 16, cell));
+                    }
+                }
+            }
+            for line in 1..=12 {
+                let body = format!("{region} note {line} explains the reported figures.");
+                lines.push((10, 72, 560 - line * 16, body));
+            }
+            lines
+        })
+        .collect();
+    make_helvetica_lines_pdf(&pages)
+}
+
+/// A line repeated at the page edges is kept where it first appears outside
+/// a table, as in `process_pdf_mem`: the table's header row on the first
+/// page does not count as its first appearance.
+#[test]
+fn test_extract_pages_markdown_with_options_ignores_tables_when_judging_running_lines() {
+    let pdf = make_table_header_then_plain_row_pdf();
+    let row = "Region Quarter Revenue Margin";
+
+    let whole = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert_eq!(whole.matches(row).count(), 1, "{whole}");
+
+    let result =
+        extract_pages_markdown_mem_with_options(&pdf, None, MarkdownOptions::default()).unwrap();
+    assert!(result.pages[0].markdown.contains("|Region|"));
+    for (index, page) in result.pages.iter().enumerate() {
+        let markdown = &page.markdown;
+        assert_eq!(markdown.contains(row), index == 1, "{markdown}");
+        assert!(markdown.contains("note 12 explains"), "{markdown}");
     }
 }
 

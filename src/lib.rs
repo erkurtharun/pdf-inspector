@@ -589,7 +589,46 @@ pub fn extract_pages_markdown_mem(
         pages,
         None,
         &MarkdownOptions::default(),
+        HeaderFooterStripping::Off,
         false,
+        false,
+    )
+    .map(|extraction| extraction.result)
+}
+
+/// [`extract_pages_markdown_mem`] with the given Markdown options.
+///
+/// `base_font_size` is taken from the whole document, and
+/// `include_page_numbers` is not used.
+///
+/// With `strip_headers_footers` (the default), each page loses the running
+/// headers and footers that [`process_pdf_mem`] strips from the whole
+/// document, judged from the lines outside tables on every page and not
+/// only the selected ones. In a document of three or more pages, a line
+/// repeated at the page edges is removed from every page after the first
+/// one it appears on outside a table, also when only later pages are
+/// requested. In a one- or two-page document, short isolated blocks at a
+/// page's top or bottom edge are removed instead.
+/// [`extract_pages_markdown_mem`] keeps those lines. A page whose only text
+/// is stripped comes back empty with `needs_ocr` set, as a page holding only
+/// its page number does.
+///
+/// Rust only (not in the Python, Node.js or WebAssembly bindings).
+pub fn extract_pages_markdown_mem_with_options(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    options: MarkdownOptions,
+) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        None,
+        &options,
+        if options.strip_headers_footers {
+            HeaderFooterStripping::AsDocument
+        } else {
+            HeaderFooterStripping::Off
+        },
         false,
         false,
     )
@@ -612,7 +651,11 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         pages,
         password,
         markdown_options,
-        markdown_options.strip_headers_footers,
+        if markdown_options.strip_headers_footers {
+            HeaderFooterStripping::RepeatedBeforeTables
+        } else {
+            HeaderFooterStripping::Off
+        },
         true,
         render_repairs,
     )
@@ -623,7 +666,7 @@ fn extract_pages_markdown_mem_impl(
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
-    strip_repeated_headers_footers: bool,
+    header_footer_stripping: HeaderFooterStripping,
     preserve_ocr_candidates: bool,
     render_repairs: bool,
 ) -> Result<InternalPagesExtraction, PdfError> {
@@ -675,10 +718,58 @@ fn extract_pages_markdown_mem_impl(
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
-    let repeated_header_footer_items = if strip_repeated_headers_footers {
-        repeated_header_footer_item_keys(&all_items, &page_thresholds, &chart_regions, page_count)
-    } else {
-        HashSet::new()
+    let running_furniture = matches!(header_footer_stripping, HeaderFooterStripping::AsDocument)
+        .then(|| {
+            let text_items: Vec<TextItem> = all_items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.item_type,
+                        types::ItemType::Text | types::ItemType::FormField
+                    )
+                })
+                .cloned()
+                .collect();
+            markdown::running_furniture_keys(&text_items)
+        });
+    let (repeated_header_footer_items, header_footer_items): (
+        HashSet<HeaderFooterItemKey>,
+        HashSet<HeaderFooterItemKey>,
+    ) = match header_footer_stripping {
+        HeaderFooterStripping::Off => (HashSet::new(), HashSet::new()),
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        HeaderFooterStripping::RepeatedBeforeTables => (
+            repeated_header_footer_item_keys(
+                &all_items,
+                &page_thresholds,
+                &chart_regions,
+                page_count,
+            ),
+            HashSet::new(),
+        ),
+        HeaderFooterStripping::AsDocument => {
+            let lines = markdown::lines_outside_tables(
+                all_items.clone(),
+                MarkdownOptions {
+                    base_font_size: Some(font_stats.most_common_size),
+                    include_page_numbers: false,
+                    ..markdown_options.clone()
+                },
+                &all_rects,
+                &all_lines,
+                markdown::MarkdownDocumentContext {
+                    page_thresholds: &page_thresholds,
+                    struct_roles: None,
+                    struct_tables: &[],
+                    page_count,
+                    prefiltered_page_number_pages: Some(&removed_page_number_pages),
+                    prefiltered_page_number_mask: Some(&page_number_removal_mask),
+                    precomputed_chart_regions: Some(&chart_regions),
+                    precomputed_running_furniture: running_furniture.as_ref(),
+                },
+            );
+            (HashSet::new(), header_footer_item_keys(lines, page_count))
+        }
     };
 
     // When caller doesn't specify pages, return every page in document order.
@@ -714,14 +805,17 @@ fn extract_pages_markdown_mem_impl(
         let page_1idx = page_0idx + 1;
 
         // Partition items, removal decisions, and rects for this page only.
-        let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
+        let (page_items, page_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
             .iter()
             .zip(&page_number_removal_mask)
             .filter(|(item, _)| {
                 item.page == page_1idx
                     && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
             })
-            .map(|(item, remove)| (item.clone(), *remove))
+            .map(|(item, remove)| {
+                let furniture = header_footer_items.contains(&HeaderFooterItemKey::from(item));
+                (item.clone(), *remove || furniture)
+            })
             .unzip();
 
         let page_rects: Vec<PdfRect> = all_rects
@@ -797,8 +891,9 @@ fn extract_pages_markdown_mem_impl(
                     struct_tables: &[],
                     page_count,
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
-                    prefiltered_page_number_mask: Some(&page_number_removal_mask),
+                    prefiltered_page_number_mask: Some(&page_removal_mask),
                     precomputed_chart_regions: Some(&chart_regions),
+                    precomputed_running_furniture: running_furniture.as_ref(),
                 },
             )
         };
@@ -926,6 +1021,17 @@ fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
     )
 }
 
+#[derive(Clone, Copy)]
+enum HeaderFooterStripping {
+    Off,
+    /// Lines repeated at the page edges are removed before table detection.
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    RepeatedBeforeTables,
+    /// Lines are removed where a conversion of the whole document strips
+    /// them, after table detection.
+    AsDocument,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HeaderFooterItemKey {
     page: u32,
@@ -945,6 +1051,7 @@ impl From<&TextItem> for HeaderFooterItemKey {
     }
 }
 
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 fn repeated_header_footer_item_keys(
     items: &[TextItem],
     page_thresholds: &HashMap<u32, f32>,
@@ -967,6 +1074,13 @@ fn repeated_header_footer_item_keys(
         &HashSet::new(),
         chart_regions,
     );
+    header_footer_item_keys(lines, page_count)
+}
+
+fn header_footer_item_keys(
+    lines: Vec<types::TextLine>,
+    page_count: u32,
+) -> HashSet<HeaderFooterItemKey> {
     let all_items: HashSet<_> = lines
         .iter()
         .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
@@ -4855,6 +4969,7 @@ fn process_document(
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
                         precomputed_chart_regions: Some(&chart_regions),
+                        precomputed_running_furniture: None,
                     },
                 ))
             };

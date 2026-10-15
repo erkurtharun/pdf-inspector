@@ -457,7 +457,7 @@ fn merged_retry_skips_body_font(detected_columns: bool, has_chart_regions: bool)
 /// Identity of a piece of page furniture: the same trimmed text drawn at the
 /// same position (quantized to 0.5pt) — page numbers excluded by construction
 /// because their text differs per page.
-type FurnitureKey = (String, i32, i32);
+pub(crate) type FurnitureKey = (String, i32, i32);
 
 fn furniture_key(item: &TextItem) -> FurnitureKey {
     (
@@ -483,7 +483,7 @@ const RUNNING_FURNITURE_BAND: f32 = 0.2;
 /// top/bottom [`RUNNING_FURNITURE_BAND`] of each page's content extent —
 /// running headers and footers. Single- and two-page documents produce an
 /// empty set.
-fn running_furniture_keys(items: &[TextItem]) -> HashSet<FurnitureKey> {
+pub(crate) fn running_furniture_keys(items: &[TextItem]) -> HashSet<FurnitureKey> {
     // Vertical content extent per page, so the edge bands adapt to the
     // document's real margins instead of assuming a media box.
     let mut page_extent: HashMap<u32, (f32, f32)> = HashMap::new();
@@ -911,6 +911,7 @@ impl TableDetectionOutput {
 #[derive(Default)]
 struct MarkdownConversionOutput {
     markdown: String,
+    lines_outside_tables: Vec<crate::types::TextLine>,
     #[cfg(feature = "ocr")]
     detected_tables: Vec<(u32, crate::tables::Table)>,
 }
@@ -1428,6 +1429,7 @@ pub fn to_markdown_from_items_with_rects_and_page_count(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            precomputed_running_furniture: None,
         },
     )
 }
@@ -1448,6 +1450,9 @@ pub(crate) struct MarkdownDocumentContext<'a> {
     /// Optional chart masks shared with layout analysis so the geometry is
     /// detected once and interpreted identically by both pipelines.
     pub(crate) precomputed_chart_regions: Option<&'a PageChartRegions>,
+    /// Optional running header/footer keys judged over the whole document,
+    /// for callers that convert one page at a time.
+    pub(crate) precomputed_running_furniture: Option<&'a HashSet<FurnitureKey>>,
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -1468,8 +1473,30 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         pdf_lines,
         context,
         TableOutputMode::Markdown,
+        false,
     )
     .markdown
+}
+
+/// The text lines outside tables that the conversion of these items judges
+/// for running headers and footers, before any are stripped.
+pub(crate) fn lines_outside_tables(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+) -> Vec<crate::types::TextLine> {
+    convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown,
+        true,
+    )
+    .lines_outside_tables
 }
 
 /// Run the ordinary Markdown table pipeline but return only structurally
@@ -1494,8 +1521,10 @@ pub(crate) fn complete_table_markdown_from_items(
             prefiltered_page_number_pages: None,
             prefiltered_page_number_mask: None,
             precomputed_chart_regions: None,
+            precomputed_running_furniture: None,
         },
         TableOutputMode::CompleteTables,
+        false,
     );
     let mut output = String::new();
     for (_, table) in conversion.detected_tables {
@@ -1518,6 +1547,7 @@ fn convert_items_with_rects_lines_and_table_output(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
     table_output_mode: TableOutputMode,
+    lines_outside_tables_only: bool,
 ) -> MarkdownConversionOutput {
     use crate::tables::{
         content_width, detect_tables_from_lines, detect_tables_from_rects,
@@ -1533,6 +1563,7 @@ fn convert_items_with_rects_lines_and_table_output(
         prefiltered_page_number_pages,
         prefiltered_page_number_mask,
         precomputed_chart_regions,
+        precomputed_running_furniture,
     } = context;
 
     if items.is_empty() {
@@ -1598,7 +1629,9 @@ fn convert_items_with_rects_lines_and_table_output(
     // pages. When such a block wraps a long title over aligned lines, the
     // heuristic detector reads it as a table. Knowing which items are page
     // furniture is a document-wide question, so answer it once here.
-    let running_furniture = running_furniture_keys(&text_items);
+    let running_furniture = precomputed_running_furniture
+        .cloned()
+        .unwrap_or_else(|| running_furniture_keys(&text_items));
 
     // Pre-group items by page with their global indices (O(n) instead of O(pages*n))
     let mut page_groups: HashMap<u32, Vec<(usize, &TextItem)>> = HashMap::new();
@@ -2385,6 +2418,13 @@ fn convert_items_with_rects_lines_and_table_output(
         all_lines
     };
 
+    if lines_outside_tables_only {
+        return MarkdownConversionOutput {
+            lines_outside_tables: lines,
+            ..MarkdownConversionOutput::default()
+        };
+    }
+
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
         furniture::strip_header_footer_lines(lines, document_page_count)
@@ -2406,6 +2446,7 @@ fn convert_items_with_rects_lines_and_table_output(
     );
     MarkdownConversionOutput {
         markdown,
+        lines_outside_tables: Vec::new(),
         #[cfg(feature = "ocr")]
         detected_tables,
     }
@@ -2754,6 +2795,7 @@ mod tests {
                 prefiltered_page_number_pages: Some(&removed_pages),
                 prefiltered_page_number_mask: Some(&removal_mask),
                 precomputed_chart_regions: None,
+                precomputed_running_furniture: None,
             },
         );
 

@@ -9,6 +9,21 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- Rust `extract_pages_markdown_mem_with_options` (the Python, Node and
+  WebAssembly bindings do not expose it): `extract_pages_markdown_mem` with
+  a `MarkdownOptions`. With `strip_headers_footers`, the default, each page
+  loses the running headers and footers that `process_pdf_mem` strips from
+  the whole document, judged from the lines outside tables on every page: a
+  line repeated at the page edges of a document of three or more pages is
+  kept on the first page it appears on outside a table and removed from the
+  later ones, also when only later pages are requested. As in
+  `process_pdf_mem`, a table's header row repeated at the top of each page
+  stays in its table, and a running header or footer that lines up like a
+  grid is not read as a table. `extract_pages_markdown_mem` and the OCR
+  pipeline are unchanged.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
