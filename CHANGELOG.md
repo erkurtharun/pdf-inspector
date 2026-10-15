@@ -9,6 +9,12 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Changed
+
+- `PDF_INSPECTOR_BCMAPS_DIR` is no longer read, so a conversion no longer
+  depends on that process-wide setting. The built-in CMaps come only from
+  the copies compiled into the binary; replacing one takes a rebuild.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that

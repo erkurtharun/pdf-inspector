@@ -4,10 +4,7 @@
 
 use log::{debug, warn};
 use lopdf::{Document, Object, ObjectId};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::PathBuf;
 
 use crate::glyph_names::glyph_name_to_string;
 
@@ -16,8 +13,7 @@ use crate::glyph_names::glyph_name_to_string;
 /// `cargo install` bakes `CARGO_MANIFEST_DIR` in as the registry (or a
 /// temporary) checkout and does not keep that directory around as a
 /// resource root. Reading the maps from disk at that path fails once the
-/// checkout is gone, so the files are embedded and the directory is only
-/// consulted when `PDF_INSPECTOR_BCMAPS_DIR` points at a replacement.
+/// checkout is gone, so the files are embedded.
 static BUILTIN_CMAPS: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/external/bcmaps");
 
@@ -2408,7 +2404,7 @@ pub(crate) fn glyph_text(
 fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     let name = format!("Adobe-{}-UCS2.bcmap", ordering);
     let data = read_builtin_cmap_file(&name)?;
-    let mut cmap = parse_binary_cmap(&data).ok()?;
+    let mut cmap = parse_binary_cmap(data).ok()?;
     if cmap.char_map.is_empty() && cmap.ranges.is_empty() {
         return None;
     }
@@ -2422,23 +2418,8 @@ fn build_cmap_from_builtin_cmap(ordering: &str) -> Option<ToUnicodeCMap> {
     Some(cmap)
 }
 
-/// Replacement directory for the embedded CMaps. Unset means the copy
-/// compiled into the binary is used, which is what `cargo install` and the
-/// published wheels have at runtime.
-#[cfg(not(target_arch = "wasm32"))]
-fn read_bcmap_override(name: &str) -> Option<Vec<u8>> {
-    let dir = std::env::var_os("PDF_INSPECTOR_BCMAPS_DIR")?;
-    std::fs::read(PathBuf::from(dir).join(name)).ok()
-}
-
-fn read_builtin_cmap_file(name: &str) -> Option<Cow<'static, [u8]>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(bytes) = read_bcmap_override(name) {
-        return Some(Cow::Owned(bytes));
-    }
-    BUILTIN_CMAPS
-        .get_file(name)
-        .map(|file| Cow::Borrowed(file.contents()))
+fn read_builtin_cmap_file(name: &str) -> Option<&'static [u8]> {
+    BUILTIN_CMAPS.get_file(name).map(|file| file.contents())
 }
 
 fn parse_binary_cmap(data: &[u8]) -> Result<ToUnicodeCMap, String> {
@@ -2754,7 +2735,7 @@ fn parse_encoding_cmap_object(obj: &Object, doc: &Document) -> Option<EncodingCM
 
 fn load_builtin_encoding_cmap(name: &str) -> Option<EncodingCMap> {
     let data = read_builtin_cmap_file(&format!("{}.bcmap", name))?;
-    parse_binary_cmap_encoding(&data).ok()
+    parse_binary_cmap_encoding(data).ok()
 }
 
 fn parse_encoding_cmap_stream(data: &[u8]) -> Option<EncodingCMap> {
@@ -3074,7 +3055,7 @@ fn load_builtin_cmap_by_name(name: &str) -> Option<ToUnicodeCMap> {
         return None;
     }
     let data = read_builtin_cmap_file(&format!("{}.bcmap", name))?;
-    let mut cmap = parse_binary_cmap(&data).ok()?;
+    let mut cmap = parse_binary_cmap(data).ok()?;
     if cmap.char_map.is_empty() && cmap.ranges.is_empty() {
         return None;
     }
@@ -3797,14 +3778,8 @@ mod tests {
             "Adobe-Korea1-UCS2.bcmap",
             "90ms-RKSJ-H.bcmap",
         ] {
-            // Read the compiled-in copy directly. read_builtin_cmap_file
-            // prefers PDF_INSPECTOR_BCMAPS_DIR, so a set override would
-            // compare that directory to the source tree and never check
-            // the bytes in the binary.
-            let embedded = BUILTIN_CMAPS
-                .get_file(name)
-                .unwrap_or_else(|| panic!("{name} was not embedded"))
-                .contents();
+            let embedded =
+                read_builtin_cmap_file(name).unwrap_or_else(|| panic!("{name} was not embedded"));
             let disk = std::fs::read(format!(
                 "{}/external/bcmaps/{name}",
                 env!("CARGO_MANIFEST_DIR")
@@ -3812,7 +3787,33 @@ mod tests {
             .unwrap_or_else(|err| panic!("reading {name}: {err}"));
             assert_eq!(embedded, disk.as_slice(), "{name}");
         }
-        assert!(BUILTIN_CMAPS.get_file("does-not-exist.bcmap").is_none());
+        assert!(read_builtin_cmap_file("does-not-exist.bcmap").is_none());
+    }
+
+    #[test]
+    fn builtin_cmaps_are_not_read_from_the_environment() {
+        let name = "Adobe-Japan1-UCS2.bcmap";
+        if std::env::var_os("PDF_INSPECTOR_BCMAPS_TEST_CHILD").is_some() {
+            let embedded = BUILTIN_CMAPS.get_file(name).unwrap().contents();
+            assert_eq!(read_builtin_cmap_file(name), Some(embedded));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(name), b"replacement").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tounicode::tests::builtin_cmaps_are_not_read_from_the_environment",
+            ])
+            .env("PDF_INSPECTOR_BCMAPS_DIR", dir.path())
+            .env("PDF_INSPECTOR_BCMAPS_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(" 1 passed"),
+            "{stdout}"
+        );
     }
 
     #[test]
