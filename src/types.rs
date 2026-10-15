@@ -718,20 +718,26 @@ pub(crate) fn stacked_fraction_slash(prev: &TextItem, item: &TextItem) -> bool {
 
 /// Append an item's text, wrapping a super/subscript run in its tag.
 /// Shared by line rendering and table-cell joining so both emit the same
-/// markup for a run.
-pub(crate) fn push_item_text(result: &mut String, item: &TextItem, text: &str) {
+/// markup for a run. With `escape`, the text is backslash-escaped inside
+/// the tag (`crate::markdown::escape::escape_inline`).
+pub(crate) fn push_item_text(result: &mut String, item: &TextItem, text: &str, escape: bool) {
+    let text = if escape {
+        crate::markdown::escape::escape_inline(text)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
     let tag = if item.baseline_shift > 0.0 {
         "sup"
     } else if item.baseline_shift < 0.0 {
         "sub"
     } else {
-        result.push_str(text);
+        result.push_str(&text);
         return;
     };
     result.push('<');
     result.push_str(tag);
     result.push('>');
-    result.push_str(text);
+    result.push_str(&text);
     result.push_str("</");
     result.push_str(tag);
     result.push('>');
@@ -752,8 +758,37 @@ impl TextLine {
         format_italic: bool,
         format_decorations: bool,
     ) -> String {
+        self.markdown_text(format_bold, format_italic, format_decorations, false)
+    }
+
+    /// [`Self::text_with_formatting`], with each run's text backslash-escaped
+    /// when `escape` is set, so that only the markup written here reads as
+    /// Markdown, and a block marker escaped after each line break the
+    /// joined runs carry.
+    pub(crate) fn markdown_text(
+        &self,
+        format_bold: bool,
+        format_italic: bool,
+        format_decorations: bool,
+        escape: bool,
+    ) -> String {
+        let text = self.formatted_text(format_bold, format_italic, format_decorations, escape);
+        if escape && text.contains(['\n', '\r']) {
+            crate::markdown::escape::escape_inner_line_starts(&text)
+        } else {
+            text
+        }
+    }
+
+    fn formatted_text(
+        &self,
+        format_bold: bool,
+        format_italic: bool,
+        format_decorations: bool,
+        escape: bool,
+    ) -> String {
         if !format_bold && !format_italic && !format_decorations {
-            return self.text_plain();
+            return self.text_plain(escape);
         }
 
         let single_char_threshold = self.adaptive_threshold;
@@ -883,12 +918,12 @@ impl TextLine {
                     result.push('<');
                     result.push_str(tag);
                     result.push('>');
-                    push_item_text(&mut result, item, text_trimmed);
+                    push_item_text(&mut result, item, text_trimmed, escape);
                     result.push_str("</");
                     result.push_str(tag);
                     result.push('>');
                 }
-                None => push_item_text(&mut result, item, text_trimmed),
+                None => push_item_text(&mut result, item, text_trimmed, escape),
             }
         }
 
@@ -916,7 +951,7 @@ impl TextLine {
     /// `<sup>…</sup>` / `<sub>…</sub>`: without the tags the marker digits
     /// would be indistinguishable from the body text they follow
     /// ("Yibo Yan1,2,3" vs "Yibo Yan<sup>1,2,3</sup>").
-    fn text_plain(&self) -> String {
+    fn text_plain(&self, escape: bool) -> String {
         let single_char_threshold = self.adaptive_threshold;
 
         let mut result = String::new();
@@ -934,7 +969,7 @@ impl TextLine {
             if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
                 result.push('/');
             }
-            push_item_text(&mut result, item, item.text.as_str());
+            push_item_text(&mut result, item, item.text.as_str(), escape);
         }
         result
     }

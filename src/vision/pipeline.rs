@@ -287,9 +287,11 @@ pub fn process_pdf_with_ocr_mem(
         let page_number = page.page + 1;
         let markdown = std::mem::take(&mut page.markdown);
         if may_preserve_extractor_candidate(page_number, &native.ocr_reasons_by_page) {
-            if let Some(candidate) =
-                assess_native_candidate(markdown, NativeCandidateOrigin::Extractor)
-            {
+            if let Some(candidate) = assess_native_candidate(
+                markdown,
+                NativeCandidateOrigin::Extractor,
+                page_markdown_options.escape_text,
+            ) {
                 native_candidates.insert(page_number, candidate);
             }
         }
@@ -334,9 +336,11 @@ pub fn process_pdf_with_ocr_mem(
                 else {
                     continue;
                 };
-                let Some(candidate) =
-                    assess_native_candidate(markdown, NativeCandidateOrigin::Pdfium)
-                else {
+                let Some(candidate) = assess_native_candidate(
+                    markdown,
+                    NativeCandidateOrigin::Pdfium,
+                    page_markdown_options.escape_text,
+                ) else {
                     continue;
                 };
                 let may_skip_ocr = complete_recovery_candidates.contains(&page.page)
@@ -1474,6 +1478,58 @@ mod tests {
         assert!(ocr.result.pages[0]
             .markdown
             .contains("Order Detail Report by Account"));
+    }
+
+    #[test]
+    fn escaped_page_keeps_the_text_quality_verdict() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let content = "BT /F1 12 Tf 72 700 Td (Name ______________________________) Tj ET
+BT /F1 12 Tf 72 680 Td (Date ______________________________) Tj ET
+BT /F1 12 Tf 72 660 Td (Signature _________________________) Tj ET";
+        let mut doc = Document::with_version("1.4");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let contents = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            "Contents" => contents,
+        });
+        let pages = doc.add_object(
+            dictionary! { "Type" => "Pages", "Count" => 1, "Kids" => vec![Object::Reference(page)] },
+        );
+        doc.get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Parent", pages);
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let extract = |escape_text| {
+            crate::extract_pages_markdown_mem_for_ocr(
+                &bytes,
+                None,
+                None,
+                &MarkdownOptions {
+                    escape_text,
+                    ..MarkdownOptions::default()
+                },
+                false,
+            )
+            .unwrap()
+            .result
+        };
+
+        let plain = extract(false);
+        let escaped = extract(true);
+        assert!(!plain.pages[0].needs_ocr);
+        assert!(escaped.pages[0].markdown.contains(r"Name \_"));
+        assert_eq!(escaped.pages[0].needs_ocr, plain.pages[0].needs_ocr);
+        assert_eq!(escaped.pages_needing_ocr, plain.pages_needing_ocr);
     }
 
     #[test]

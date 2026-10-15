@@ -9,6 +9,7 @@
 pub(crate) mod analysis;
 mod classify;
 mod convert;
+pub(crate) mod escape;
 mod furniture;
 mod heading;
 mod postprocess;
@@ -21,11 +22,14 @@ use std::collections::{HashMap, HashSet};
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
-use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
+use classify::{
+    format_escaped_list_item, format_list_item, is_caption_line, is_code_like, is_list_item,
+};
 use convert::{
     merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
     PositionedMarkdown,
 };
+use escape::{escape_block_start, escape_inline};
 
 const CHART_REGION_PAD: f32 = 20.0;
 const CHART_SEPARATOR_PAD: f32 = 8.0;
@@ -850,6 +854,7 @@ enum TableOutputMode {
 
 struct TableDetectionOutput {
     mode: TableOutputMode,
+    escape_text: bool,
     pages_with_detected_tables: HashSet<u32>,
     pages_with_tables: HashSet<u32>,
     markdown_by_page: HashMap<u32, Vec<PositionedMarkdown>>,
@@ -858,9 +863,10 @@ struct TableDetectionOutput {
 }
 
 impl TableDetectionOutput {
-    fn new(mode: TableOutputMode) -> Self {
+    fn new(mode: TableOutputMode, escape_text: bool) -> Self {
         Self {
             mode,
+            escape_text,
             pages_with_detected_tables: HashSet::new(),
             pages_with_tables: HashSet::new(),
             markdown_by_page: HashMap::new(),
@@ -885,7 +891,7 @@ impl TableDetectionOutput {
                     .push(PositionedMarkdown::new(
                         table.rows.first().copied().unwrap_or(0.0),
                         table.columns.first().copied().unwrap_or(0.0),
-                        crate::tables::table_to_markdown(table),
+                        crate::tables::table_to_markdown_with(table, self.escape_text),
                         chart_order,
                     ));
             }
@@ -1291,6 +1297,12 @@ pub struct MarkdownOptions {
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
     pub strip_headers_footers: bool,
+    /// Backslash-escape source text that Markdown would read as syntax:
+    /// emphasis, code, link, HTML, entity, pipe and strikethrough characters
+    /// in each run, and heading, quote, list and setext markers at the start
+    /// of a line. Markup the converter writes and code blocks are left as
+    /// they are. Off by default.
+    pub escape_text: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -1320,6 +1332,7 @@ impl Default for MarkdownOptions {
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
+            escape_text: false,
         }
     }
 }
@@ -1347,7 +1360,11 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
 
         // Detect list items
         if options.detect_lists && is_list_item(trimmed) {
-            let formatted = format_list_item(trimmed);
+            let formatted = if options.escape_text {
+                format_escaped_list_item(&escape_inline(trimmed))
+            } else {
+                format_list_item(trimmed)
+            };
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -1369,7 +1386,11 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
         }
 
         // Regular paragraph text
-        output.push_str(trimmed);
+        if options.escape_text {
+            output.push_str(&escape_block_start(&escape_inline(trimmed)));
+        } else {
+            output.push_str(trimmed);
+        }
         output.push('\n');
     }
 
@@ -1481,6 +1502,7 @@ pub(crate) fn complete_table_markdown_from_items(
     options: MarkdownOptions,
     document_page_count: u32,
 ) -> String {
+    let escape_text = options.escape_text;
     let conversion = convert_items_with_rects_lines_and_table_output(
         items,
         options,
@@ -1499,7 +1521,7 @@ pub(crate) fn complete_table_markdown_from_items(
     );
     let mut output = String::new();
     for (_, table) in conversion.detected_tables {
-        let markdown = crate::tables::table_to_markdown(&table);
+        let markdown = crate::tables::table_to_markdown_with(&table, escape_text);
         if markdown.is_empty() {
             continue;
         }
@@ -1592,7 +1614,7 @@ fn convert_items_with_rects_lines_and_table_output(
 
     // Detect tables on each page
     let mut table_items: HashSet<usize> = HashSet::new();
-    let mut table_output = TableDetectionOutput::new(table_output_mode);
+    let mut table_output = TableDetectionOutput::new(table_output_mode, options.escape_text);
 
     // Running headers/footers repeat verbatim at the same position on many
     // pages. When such a block wraps a long title over aligned lines, the
@@ -2420,7 +2442,7 @@ mod tests {
     #[cfg(feature = "ocr")]
     #[test]
     fn complete_table_output_marks_only_pages_with_emitted_tables() {
-        let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables);
+        let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables, false);
         let incomplete = crate::tables::Table::new(
             vec![100.0, 200.0],
             vec![300.0],
@@ -2507,6 +2529,33 @@ mod tests {
         let md = to_markdown(text, MarkdownOptions::default());
         assert!(md.contains("- First item"));
         assert!(md.contains("- Second item"));
+    }
+
+    #[test]
+    fn test_to_markdown_escape_text() {
+        let text = "# 3 items\n*note* a_b <u>c\n* - d\n• *e*\n1. Scope";
+        let escaped = to_markdown(
+            text,
+            MarkdownOptions {
+                escape_text: true,
+                ..MarkdownOptions::default()
+            },
+        );
+        assert_eq!(
+            escaped,
+            r"\# 3 items
+\*note\* a\_b \<u\>c
+- \- d
+- \*e\*
+1. Scope
+"
+        );
+
+        let plain = to_markdown(text, MarkdownOptions::default());
+        assert_eq!(
+            plain,
+            "# 3 items\n*note* a_b <u>c\n* - d\n- *e*\n1. Scope\n"
+        );
     }
 
     fn furniture_item(text: &str, x: f32, y: f32, page: u32) -> TextItem {
@@ -2759,6 +2808,53 @@ mod tests {
 
         assert!(markdown.contains("|1|2|"), "{markdown}");
         assert!(markdown.contains("|7|8|"), "{markdown}");
+    }
+
+    /// With `escape_text`, a ruled table's cell text is escaped and the
+    /// `<sup>` the converter writes around a superscript run is kept.
+    #[test]
+    fn escaped_table_cells_keep_script_tags() {
+        let mut items = Vec::new();
+        let mut rects = Vec::new();
+        let cells = [["Name", "Value"], ["*x*", "12"], ["y", "3"], ["z", "4"]];
+        for (row, texts) in cells.iter().enumerate() {
+            for (column, text) in texts.iter().enumerate() {
+                let mut item = make_item_w(
+                    110.0 + column as f32 * 100.0,
+                    30.0 + row as f32 * 20.0,
+                    20.0,
+                    1,
+                );
+                item.text = text.to_string();
+                items.push(item);
+                rects.push(PdfRect {
+                    x: 100.0 + column as f32 * 100.0,
+                    y: 20.0 + row as f32 * 20.0,
+                    width: 100.0,
+                    height: 20.0,
+                    page: 1,
+                });
+            }
+        }
+        let mut marker = make_item_w(230.0, 54.0, 4.0, 1);
+        marker.text = "*".into();
+        marker.font_size = 6.0;
+        marker.height = 6.0;
+        marker.baseline_shift = 4.0;
+        items.push(marker);
+
+        let escaped = to_markdown_from_items_with_rects(
+            items.clone(),
+            MarkdownOptions {
+                escape_text: true,
+                ..MarkdownOptions::default()
+            },
+            &rects,
+        );
+        assert!(escaped.contains(r"|\*x\*|12<sup>\*</sup>|"), "{escaped}");
+
+        let plain = to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects);
+        assert!(plain.contains("|*x*|12<sup>*</sup>|"), "{plain}");
     }
 
     #[test]

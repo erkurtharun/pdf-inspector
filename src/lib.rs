@@ -72,6 +72,7 @@ pub use process_mode::ProcessMode;
 pub use types::{BoldSource, LayoutComplexity, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
+use markdown::escape::unescaped_text;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use text_quality::{
@@ -803,8 +804,9 @@ fn extract_pages_markdown_mem_impl(
             )
         };
 
+        let judged = unescaped_text(&md, markdown_options.escape_text);
         let has_decoding_issue = has_text_quality_issue
-            || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+            || (!md.is_empty() && (is_cid_garbage(&judged) || detect_encoding_issues(&judged)));
         // First among a page's reasons, as classification's
         // `page_ocr_reasons` lists it too, so a page whose whole text layer
         // is hidden under a scan — a scan whatever its fonts are — gets the
@@ -835,7 +837,7 @@ fn extract_pages_markdown_mem_impl(
         let needs_ocr = ocr_reason.is_some()
             || md.trim().is_empty()
             || has_gid
-            || is_garbage_text(&md)
+            || is_garbage_text(&judged)
             || has_template_image
             || has_vector_text
             || has_invisible_text_layer;
@@ -4594,6 +4596,7 @@ fn process_document(
     let mod_date = detection.mod_date;
     let confidence = detection.confidence;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
+    let escape_text = options.markdown.escape_text;
 
     // DetectOnly → return immediately
     if options.mode == ProcessMode::DetectOnly {
@@ -4866,7 +4869,9 @@ fn process_document(
             let enc = !ocr_reasons_by_page.is_empty()
                 || text_quality.has_encoding_issues
                 || cmap_unmapped
-                || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
+                || md
+                    .as_ref()
+                    .is_some_and(|m| detect_encoding_issues(&unescaped_text(m, escape_text)));
             (
                 md,
                 layout,
@@ -4891,18 +4896,23 @@ fn process_document(
     // If the extracted text is predominantly garbage (non-alphanumeric) and
     // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
     // layer comes from a bad OCR pass, and callers should use proper OCR.
-    let (pdf_type, markdown, confidence) =
-        if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
-            (PdfType::Scanned, None, 0.95)
-        } else {
-            (pdf_type, markdown, confidence)
-        };
+    let (pdf_type, markdown, confidence) = if pdf_type == PdfType::Mixed
+        && markdown
+            .as_ref()
+            .is_some_and(|m| is_garbage_text(&unescaped_text(m, escape_text)))
+    {
+        (PdfType::Scanned, None, 0.95)
+    } else {
+        (pdf_type, markdown, confidence)
+    };
 
     // If a TextBased PDF produces garbage text, the fonts are undecodable
     // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
     // Drop the useless markdown and flag all pages for OCR.
     let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
-        && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
+        && markdown
+            .as_ref()
+            .is_some_and(|m| is_garbage_text(&unescaped_text(m, escape_text)))
     {
         log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
         (None, true, true)
@@ -4949,7 +4959,9 @@ fn process_document(
         && pages_needing_ocr.is_empty()
         && markdown.is_some()
     {
-        let md_len = markdown.as_ref().map_or(0, |m| m.len());
+        let md_len = markdown
+            .as_ref()
+            .map_or(0, |m| unescaped_text(m, escape_text).len());
         let chars_per_page = md_len as f32 / page_count as f32;
         if chars_per_page < 50.0 && md_len < 500 {
             log::debug!(

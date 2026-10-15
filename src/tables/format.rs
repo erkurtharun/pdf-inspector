@@ -1,8 +1,17 @@
 //! Table-to-markdown formatting and cell cleanup.
 
+use std::borrow::Cow;
+
 use super::{Table, TableKind};
+use crate::markdown::escape::{escape_block_start, escape_inline, escape_inner_line_starts};
 
 pub fn table_to_markdown(table: &Table) -> String {
+    table_to_markdown_with(table, false)
+}
+
+/// [`table_to_markdown`], with the text of each cell backslash-escaped
+/// outside its `<sup>`/`<sub>` tags when `escape_text` is set.
+pub(crate) fn table_to_markdown_with(table: &Table, escape_text: bool) -> String {
     if table.cells.is_empty() || table.cells[0].is_empty() {
         return String::new();
     }
@@ -14,7 +23,7 @@ pub fn table_to_markdown(table: &Table) -> String {
     // separate TOC entries (e.g. "6.2 Contamination" + "6.2.1 SWE-bench")
     // into one line where sub-entries leave column 0 empty.
     if table.kind == TableKind::Toc {
-        return format_toc_as_list(&table.cells, &[]);
+        return format_toc_as_list(&table.cells, &[], escape_text);
     }
 
     // Clean up the table: merge continuation rows, extract footnotes, remove empty rows
@@ -32,7 +41,7 @@ pub fn table_to_markdown(table: &Table) -> String {
     for (row_idx, row) in cleaned_cells.iter().enumerate() {
         output.push('|');
         for cell in row.iter() {
-            output.push_str(cell);
+            output.push_str(&escape_cell(cell, escape_text));
             output.push('|');
         }
         output.push('\n');
@@ -51,7 +60,7 @@ pub fn table_to_markdown(table: &Table) -> String {
     if !footnotes.is_empty() {
         output.push('\n');
         for footnote in footnotes {
-            output.push_str(&footnote);
+            output.push_str(&escape_line(&footnote, escape_text));
             output.push('\n');
         }
     }
@@ -80,7 +89,7 @@ pub(crate) fn is_complete_data_table(table: &Table) -> bool {
 /// last cell (typically a page number) is separated by a tab so the page
 /// numbers stay aligned with their titles instead of being pulled into a
 /// separate column by the column-aware reader.
-fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
+fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String], escape_text: bool) -> String {
     let mut output = String::new();
 
     for row in cells {
@@ -126,13 +135,15 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
         }
 
         if !title.is_empty() {
-            output.push_str(&title);
+            output.push_str(&escape_line(&title, escape_text));
         }
         if let Some(page) = trailing {
-            if !title.is_empty() {
+            if title.is_empty() {
+                output.push_str(&escape_line(page, escape_text));
+            } else {
                 output.push('\t');
+                output.push_str(&escape_cell(page, escape_text));
             }
-            output.push_str(page);
         }
         output.push('\n');
     }
@@ -140,12 +151,47 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
     if !footnotes.is_empty() {
         output.push('\n');
         for footnote in footnotes {
-            output.push_str(footnote);
+            output.push_str(&escape_line(footnote, escape_text));
             output.push('\n');
         }
     }
 
     output
+}
+
+/// `cell` with its text escaped by [`escape_inline`] when `escape_text` is
+/// set, leaving the `<sup>`/`<sub>` tags that cell rendering writes intact,
+/// and a block marker escaped after each line break the cell carries.
+fn escape_cell(cell: &str, escape_text: bool) -> Cow<'_, str> {
+    const TAGS: [&str; 4] = ["<sup>", "</sup>", "<sub>", "</sub>"];
+    if !escape_text {
+        return Cow::Borrowed(cell);
+    }
+    let mut escaped = String::with_capacity(cell.len());
+    let mut rest = cell;
+    while let Some((at, tag)) = TAGS
+        .iter()
+        .filter_map(|tag| rest.find(tag).map(|at| (at, *tag)))
+        .min()
+    {
+        escaped.push_str(&escape_inline(&rest[..at]));
+        escaped.push_str(tag);
+        rest = &rest[at + tag.len()..];
+    }
+    escaped.push_str(&escape_inline(rest));
+    if escaped.contains(['\n', '\r']) {
+        escaped = escape_inner_line_starts(&escaped);
+    }
+    Cow::Owned(escaped)
+}
+
+/// [`escape_cell`] for text that starts a line, with a leading block marker
+/// escaped by [`escape_block_start`] as well.
+fn escape_line(line: &str, escape_text: bool) -> Cow<'_, str> {
+    if !escape_text {
+        return Cow::Borrowed(line);
+    }
+    Cow::Owned(escape_block_start(&escape_cell(line, true)).into_owned())
 }
 
 /// True when the cell looks like a page number.  Accepts:
@@ -1065,6 +1111,59 @@ mod tests {
         );
         assert!(md.contains("4.3 Case studies and targeted evaluations\t86"));
         assert!(md.contains("4.5 White-box analyses\t113"));
+    }
+
+    #[test]
+    fn escaped_toc_lines_and_footnotes_open_no_block() {
+        let toc = Table {
+            columns: vec![50.0, 300.0],
+            rows: vec![500.0; 3],
+            cells: vec![
+                vec!["1. Introduction".into(), "3".into()],
+                vec!["# Methods".into(), "5".into()],
+                vec!["- Results".into(), "8".into()],
+            ],
+            item_indices: vec![],
+            kind: TableKind::Toc,
+        };
+        let md = table_to_markdown_with(&toc, true);
+        assert!(md.contains("1\\. Introduction\t3\n"), "{md}");
+        assert!(md.contains("\\# Methods\t5\n"), "{md}");
+        assert!(md.contains("\\- Results\t8\n"), "{md}");
+        assert!(table_to_markdown(&toc).contains("1. Introduction\t3\n"));
+
+        let data = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec!["Header".into(), "Value".into()],
+                vec!["Data".into(), "100".into()],
+                vec!["1)".into(), "Source: survey".into()],
+            ],
+            item_indices: vec![],
+            kind: TableKind::Data,
+        };
+        assert!(table_to_markdown_with(&data, true).contains("\n1\\) Source: survey\n"));
+        assert!(table_to_markdown(&data).contains("\n1) Source: survey\n"));
+    }
+
+    #[test]
+    fn escaped_line_breaks_in_cells_and_footnotes_open_no_block() {
+        let data = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec!["Header".into(), "Value".into()],
+                vec!["Data\n# x".into(), "100".into()],
+                vec!["1)".into(), "Source:\n# survey".into()],
+            ],
+            item_indices: vec![],
+            kind: TableKind::Data,
+        };
+        let md = table_to_markdown_with(&data, true);
+        assert!(md.contains("|Data\n\\# x|100|"), "{md}");
+        assert!(md.contains("\n1\\) Source:\n\\# survey\n"), "{md}");
+        assert!(table_to_markdown(&data).contains("\n1) Source:\n# survey\n"));
     }
 
     #[test]

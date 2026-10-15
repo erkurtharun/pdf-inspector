@@ -1,10 +1,12 @@
 //! Geometry-aware OCR Markdown assembly and native-text fusion.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use thiserror::Error;
 
+use crate::markdown::escape::{escape_block_start, unescape_with_offsets, unescaped_text};
 use crate::markdown::{
     complete_table_markdown_from_items, to_markdown_from_items_with_rects_and_page_count,
     MarkdownOptions,
@@ -163,8 +165,9 @@ impl NativeFallbackCandidate {
 pub(crate) fn assess_native_candidate(
     markdown: String,
     origin: NativeCandidateOrigin,
+    escaped: bool,
 ) -> Option<NativeFallbackCandidate> {
-    let quality = assess_text_candidate(&markdown)?;
+    let quality = assess_text_candidate(&markdown, escaped)?;
     (quality.alphanumeric_chars >= 8).then_some(NativeFallbackCandidate {
         markdown,
         quality,
@@ -189,7 +192,7 @@ pub fn ocr_page_to_markdown(
         &[],
         document_page_count,
     );
-    preserve_ocr_line_breaks(&markdown, page)
+    preserve_ocr_line_breaks(&markdown, page, options.escape_text)
 }
 
 /// Fuses a selective OCR run into per-page native Markdown.
@@ -345,7 +348,7 @@ fn fuse_ocr_pages_impl(
                             &[],
                             document_page_count,
                         );
-                        preserve_ocr_line_breaks(&markdown, local)
+                        preserve_ocr_line_breaks(&markdown, local, options.markdown.escape_text)
                     }
                 };
                 let (markdown, source, adaptive_recommends_hosted) = if let Some(candidate) =
@@ -358,6 +361,7 @@ fn fuse_ocr_pages_impl(
                         &ocr_markdown,
                         local.ocr.mean_confidence,
                         options.hosted_recommendation_confidence,
+                        options.markdown.escape_text,
                     );
                     warnings.push(choice.warning);
                     (choice.markdown, choice.source, choice.recommend_hosted)
@@ -439,8 +443,9 @@ fn choose_adaptive_content(
     ocr: &str,
     ocr_confidence: Option<f32>,
     weak_ocr_threshold: f32,
+    escaped: bool,
 ) -> AdaptiveContentChoice {
-    let ocr_quality = assess_text_candidate(ocr);
+    let ocr_quality = assess_text_candidate(ocr, escaped);
     let weak_ocr = ocr_confidence.is_none_or(|confidence| confidence < weak_ocr_threshold);
     if weak_ocr || ocr_quality.is_none() {
         return AdaptiveContentChoice {
@@ -544,11 +549,12 @@ fn normalized_content_chars(text: &str) -> impl Iterator<Item = char> + '_ {
         .filter(|character| character.is_alphanumeric())
 }
 
-fn assess_text_candidate(markdown: &str) -> Option<TextCandidateQuality> {
+fn assess_text_candidate(markdown: &str, escaped: bool) -> Option<TextCandidateQuality> {
+    let markdown = unescaped_text(markdown, escaped);
     if markdown.trim().is_empty()
-        || is_garbage_text(markdown)
-        || is_cid_garbage(markdown)
-        || detect_encoding_issues(markdown)
+        || is_garbage_text(&markdown)
+        || is_cid_garbage(&markdown)
+        || detect_encoding_issues(&markdown)
     {
         return None;
     }
@@ -678,7 +684,7 @@ fn image_quad_bounds(
     (right > left && bottom > top).then_some((left, top, right, bottom))
 }
 
-fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
+fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage, escape: bool) -> String {
     let spans: Vec<(&str, f32, f32, f32, f32)> = page
         .ocr
         .spans
@@ -712,9 +718,15 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
     // then use Markdown order rather than imposing a second geometry sort.
     // If the mapping is incomplete or ambiguous, leave the converter output
     // untouched instead of risking a break at the wrong duplicate text.
+    let unescaped = escape.then(|| unescape_with_offsets(markdown));
     let mut mapped = Vec::with_capacity(spans.len());
     for (text, left, top, right, bottom) in spans {
-        let Some((start, end)) = unique_markdown_span(markdown, text) else {
+        let span = match &unescaped {
+            Some((plain, offsets)) => unique_markdown_span(plain, text, true)
+                .map(|(start, end)| (offsets[start], offsets[end])),
+            None => unique_markdown_span(markdown, text, false),
+        };
+        let Some((start, end)) = span else {
             return markdown.to_string();
         };
         mapped.push((start, end, left, top, right, bottom));
@@ -730,7 +742,7 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
     let mut replacements = Vec::new();
     for pair in mapped.windows(2) {
         let (_, current_end, current_left, _, current_right, current_bottom) = pair[0];
-        let (next_start, _, next_left, next_top, next_right, _) = pair[1];
+        let (next_start, next_end, next_left, next_top, next_right, _) = pair[1];
         let overlap = (current_right.min(next_right) - current_left.max(next_left)).max(0.0);
         let narrowest_width = (current_right - current_left).min(next_right - next_left);
         let same_text_flow = narrowest_width > 0.0 && overlap >= narrowest_width * 0.2;
@@ -742,18 +754,24 @@ fn preserve_ocr_line_breaks(markdown: &str, page: &RoutedOcrPage) -> String {
             && !markdown_line_at(markdown, current_end).is_some_and(is_markdown_table_line)
             && !markdown_line_at(markdown, next_start).is_some_and(is_markdown_table_line)
         {
-            replacements.push((current_end, next_start));
+            let next = &markdown[next_start..next_end];
+            let next = if escape && !between.contains('\n') {
+                escape_block_start(next)
+            } else {
+                Cow::Borrowed(next)
+            };
+            replacements.push((current_end, next_end, format!("\n\n{next}")));
         }
     }
 
     let mut output = markdown.to_string();
-    for (start, end) in replacements.into_iter().rev() {
-        output.replace_range(start..end, "\n\n");
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        output.replace_range(start..end, &replacement);
     }
     output
 }
 
-fn unique_markdown_span(markdown: &str, span_text: &str) -> Option<(usize, usize)> {
+fn unique_markdown_span(markdown: &str, span_text: &str, escaped: bool) -> Option<(usize, usize)> {
     let exact: Vec<_> = markdown.match_indices(span_text).collect();
     match exact.as_slice() {
         [(start, matched)] => return Some((*start, *start + matched.len())),
@@ -761,7 +779,7 @@ fn unique_markdown_span(markdown: &str, span_text: &str) -> Option<(usize, usize
         _ => return None,
     }
 
-    let normalized = strip_list_marker(span_text)?;
+    let normalized = strip_list_marker(span_text, escaped)?;
     let matches: Vec<_> = markdown.match_indices(normalized).collect();
     match matches.as_slice() {
         [(start, matched)] => Some((*start, *start + matched.len())),
@@ -769,11 +787,12 @@ fn unique_markdown_span(markdown: &str, span_text: &str) -> Option<(usize, usize
     }
 }
 
-fn strip_list_marker(text: &str) -> Option<&str> {
+fn strip_list_marker(text: &str, escaped: bool) -> Option<&str> {
     const BULLETS: &[char] = &['•', '●', '○', '◦', '▪', '–', '—'];
     let trimmed = text.trim_start();
     let remainder = trimmed
-        .strip_prefix(BULLETS)?
+        .strip_prefix(BULLETS)
+        .or_else(|| trimmed.strip_prefix("* ").filter(|_| escaped))?
         .trim_start_matches(char::is_whitespace);
     (!remainder.is_empty()).then_some(remainder)
 }
@@ -1150,7 +1169,12 @@ mod tests {
     }
 
     fn native_candidate(markdown: &str) -> NativeFallbackCandidate {
-        assess_native_candidate(markdown.to_string(), NativeCandidateOrigin::Extractor).unwrap()
+        assess_native_candidate(
+            markdown.to_string(),
+            NativeCandidateOrigin::Extractor,
+            false,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1440,11 +1464,55 @@ mod tests {
         );
         let markdown = "Left top Left bottom\n\nRight top Right bottom";
 
-        let recovered = preserve_ocr_line_breaks(markdown, &page);
+        let recovered = preserve_ocr_line_breaks(markdown, &page, false);
 
         assert_eq!(
             recovered,
             "Left top\n\nLeft bottom\n\nRight top\n\nRight bottom"
+        );
+    }
+
+    #[test]
+    fn escaped_line_break_recovery_matches_escaped_spans_and_escapes_block_markers() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("Rates were", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("# 3 items", 10.0, 30.0, 190.0, 40.0),
+                positioned_span("a_b", 10.0, 50.0, 190.0, 60.0),
+                positioned_span("1. Scope", 10.0, 70.0, 190.0, 80.0),
+            ],
+            Some(0.9),
+        );
+        let markdown = "Rates were # 3 items a\\_b 1. Scope";
+
+        let recovered = preserve_ocr_line_breaks(markdown, &page, true);
+
+        assert_eq!(
+            recovered,
+            "Rates were\n\n\\# 3 items\n\na\\_b\n\n1\\. Scope"
+        );
+    }
+
+    #[test]
+    fn escaped_line_break_recovery_matches_normalized_list_items() {
+        let page = routed_page(
+            1,
+            vec![
+                positioned_span("Rates were", 10.0, 10.0, 190.0, 20.0),
+                positioned_span("# 3 items", 10.0, 30.0, 190.0, 40.0),
+                positioned_span("* apples", 10.0, 50.0, 190.0, 60.0),
+                positioned_span("- # pears", 10.0, 70.0, 190.0, 80.0),
+            ],
+            Some(0.9),
+        );
+        let markdown = "Rates were # 3 items\n\n- apples\n- \\# pears";
+
+        let recovered = preserve_ocr_line_breaks(markdown, &page, true);
+
+        assert_eq!(
+            recovered,
+            "Rates were\n\n\\# 3 items\n\n- apples\n\n- \\# pears"
         );
     }
 
@@ -1464,7 +1532,7 @@ mod tests {
         );
         let markdown = "| A | B |\n|---|---|\n| x | y |\n\nFirst prose Second prose";
 
-        let recovered = preserve_ocr_line_breaks(markdown, &page);
+        let recovered = preserve_ocr_line_breaks(markdown, &page, false);
 
         assert!(recovered.starts_with("| A | B |\n|---|---|\n| x | y |"));
         assert!(recovered.ends_with("First prose\n\nSecond prose"));
@@ -1481,7 +1549,7 @@ mod tests {
             Some(0.9),
         );
 
-        let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page);
+        let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page, false);
 
         assert_eq!(recovered, "- First item\n\nNext paragraph");
     }
@@ -1497,7 +1565,7 @@ mod tests {
             Some(0.9),
         );
 
-        let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page);
+        let recovered = preserve_ocr_line_breaks("- First item Next paragraph", &page, false);
 
         assert_eq!(recovered, "- First item\n\nNext paragraph");
     }
@@ -1514,7 +1582,7 @@ mod tests {
         );
         let markdown = "Repeated Repeated";
 
-        assert_eq!(preserve_ocr_line_breaks(markdown, &page), markdown);
+        assert_eq!(preserve_ocr_line_breaks(markdown, &page, false), markdown);
     }
 
     #[test]
@@ -1650,13 +1718,34 @@ mod tests {
         assert!(assess_native_candidate(
             "請求書 合計金額 4200円\n支払済み\n".to_string(),
             NativeCandidateOrigin::Extractor,
+            false,
         )
         .is_some());
         assert!(assess_native_candidate(
             "a@@b%%c&&d==e~~".repeat(12),
             NativeCandidateOrigin::Extractor,
+            false,
         )
         .is_none());
+    }
+
+    #[test]
+    fn escaped_native_candidate_is_judged_without_its_escapes() {
+        let plain = "Name ______________________________\n\n\
+                     Date ______________________________\n\n\
+                     Signature _________________________\n";
+        let escaped = plain.replace('_', "\\_");
+        let assess = |markdown: &str, escaped| {
+            assess_native_candidate(
+                markdown.to_string(),
+                NativeCandidateOrigin::Extractor,
+                escaped,
+            )
+        };
+
+        assert!(assess(plain, false).is_some());
+        assert!(assess(&escaped, false).is_none());
+        assert!(assess(&escaped, true).is_some());
     }
 
     #[test]

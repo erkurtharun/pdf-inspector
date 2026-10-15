@@ -2,6 +2,7 @@
 
 use regex::Regex;
 
+use super::escape::ends_in_fence;
 use super::{MarkdownOptions, MarkdownProfile};
 use crate::text_utils::is_page_number_line;
 
@@ -24,12 +25,12 @@ pub(crate) fn clean_markdown(mut text: String, options: &MarkdownOptions) -> Str
 
     // Remove standalone page numbers
     if options.remove_page_numbers {
-        text = remove_page_numbers(&text);
+        text = remove_page_numbers(&text, options.escape_text);
     }
 
     // Format URLs as markdown links
     if options.format_urls {
-        text = format_urls(&text);
+        text = format_urls(&text, options.escape_text);
     }
 
     // Collapse consecutive spaces within text lines.
@@ -356,19 +357,30 @@ fn dehyphenate_line_breaks(text: &str) -> String {
     out
 }
 
-/// Remove isolated page-number expressions from Markdown.
-fn remove_page_numbers(text: &str) -> String {
+/// Remove isolated page-number expressions from Markdown. In `escaped`
+/// text a line is judged without the backslash that escapes its first
+/// character (`\- 3 -`), and `\---` is a break as `---` is.
+fn remove_page_numbers(text: &str, escaped: bool) -> String {
     let mut result = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
+    let is_break = |line: &str| {
+        let line = line.trim();
+        line == "---" || (escaped && line == "\\---")
+    };
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
+        let judged = if escaped {
+            trimmed.strip_prefix('\\').unwrap_or(trimmed)
+        } else {
+            trimmed
+        };
 
         // Check for page number patterns
-        if is_page_number_line(trimmed) {
+        if is_page_number_line(judged) {
             // Check context to determine if this is isolated
-            let prev_is_break = i > 0 && lines[i - 1].trim() == "---";
-            let next_is_break = i + 1 < lines.len() && lines[i + 1].trim() == "---";
+            let prev_is_break = i > 0 && is_break(lines[i - 1]);
+            let next_is_break = i + 1 < lines.len() && is_break(lines[i + 1]);
             let prev_is_empty = i > 0 && lines[i - 1].trim().is_empty();
             let next_is_empty = i + 1 < lines.len() && lines[i + 1].trim().is_empty();
 
@@ -378,10 +390,10 @@ fn remove_page_numbers(text: &str) -> String {
 
             // Also remove numbers that appear right before a page break
             let before_break = i + 1 < lines.len()
-                && (lines[i + 1].trim() == "---"
+                && (is_break(lines[i + 1])
                     || (i + 2 < lines.len()
                         && lines[i + 1].trim().is_empty()
-                        && lines[i + 2].trim() == "---"));
+                        && is_break(lines[i + 2])));
 
             if is_isolated || before_break {
                 continue;
@@ -394,8 +406,9 @@ fn remove_page_numbers(text: &str) -> String {
     result.join("\n")
 }
 
-/// Convert URLs to markdown links
-fn format_urls(text: &str) -> String {
+/// Convert URLs to markdown links. In `escaped` text a URL outside a code
+/// block does not end on the backslash that escapes the character after it.
+fn format_urls(text: &str, escaped: bool) -> String {
     use once_cell::sync::Lazy;
 
     // Match URLs - we'll check context manually to avoid formatting already-linked URLs
@@ -408,6 +421,15 @@ fn format_urls(text: &str) -> String {
     for mat in URL_RE.find_iter(text) {
         let start = mat.start();
         let url = mat.as_str();
+        let url = if escaped
+            && (url.len() - url.trim_end_matches('\\').len()) % 2 == 1
+            && !ends_in_fence(&text[..start])
+        {
+            &url[..url.len() - 1]
+        } else {
+            url
+        };
+        let end = start + url.len();
 
         // Check if this URL is already in a markdown link by looking at preceding chars
         // Use safe character boundary checking for multi-byte UTF-8
@@ -460,10 +482,10 @@ fn format_urls(text: &str) -> String {
             }
             pos
         };
-        let safe_end = if text.is_char_boundary(mat.end()) {
-            mat.end()
+        let safe_end = if text.is_char_boundary(end) {
+            end
         } else {
-            let mut pos = mat.end();
+            let mut pos = end;
             while pos < text.len() && !text.is_char_boundary(pos) {
                 pos += 1;
             }
@@ -862,7 +884,7 @@ mod tests {
     #[test]
     fn test_remove_page_numbers_isolated_number() {
         let input = "Some text\n\n42\n\nMore text";
-        let result = remove_page_numbers(input);
+        let result = remove_page_numbers(input, false);
         assert!(!result.contains("\n42\n"));
         assert!(result.contains("Some text"));
         assert!(result.contains("More text"));
@@ -871,21 +893,21 @@ mod tests {
     #[test]
     fn test_remove_page_numbers_before_break() {
         let input = "Content\n\n5\n---\nNext page";
-        let result = remove_page_numbers(input);
+        let result = remove_page_numbers(input, false);
         assert!(!result.contains("\n5\n"));
     }
 
     #[test]
     fn test_remove_page_numbers_in_context_kept() {
         let input = "Line A\nLine B\n42\nLine C\nLine D";
-        let result = remove_page_numbers(input);
+        let result = remove_page_numbers(input, false);
         assert!(result.contains("42"));
     }
 
     #[test]
     fn test_remove_page_numbers_labeled_header_with_content() {
         let input = "Content\n\nPage 42 explains the result\n---\nEnd";
-        let result = remove_page_numbers(input);
+        let result = remove_page_numbers(input, false);
 
         assert!(!result.contains("Page 42 explains the result"));
         assert!(result.contains("Content"));
@@ -895,7 +917,7 @@ mod tests {
     #[test]
     fn test_remove_page_numbers_preserves_page_prefixed_content() {
         let input = "PAGE0-PARA2-START substantive report text PAGE0-PARA2-END-MARKER-0";
-        let result = remove_page_numbers(input);
+        let result = remove_page_numbers(input, false);
 
         assert_eq!(result, input);
     }
@@ -903,7 +925,7 @@ mod tests {
     #[test]
     fn test_remove_page_numbers_multiple_patterns() {
         let input = "\n1\n\nContent\n\n2\n\n---\nMore\n\n3\n";
-        let result = remove_page_numbers(input);
+        let result = remove_page_numbers(input, false);
         assert!(!result.contains("\n1\n"));
         assert!(!result.contains("\n2\n"));
         assert!(!result.contains("\n3\n"));
@@ -911,34 +933,49 @@ mod tests {
 
     #[test]
     fn test_remove_page_numbers_empty() {
-        assert_eq!(remove_page_numbers(""), "");
+        assert_eq!(remove_page_numbers("", false), "");
+    }
+
+    #[test]
+    fn escaped_folio_is_removed_only_from_escaped_text() {
+        let input = "Some text\n\n\\- 3 -\n\nMore text";
+        assert_eq!(remove_page_numbers(input, true), "Some text\n\n\nMore text");
+        assert_eq!(remove_page_numbers(input, false), input);
+        assert_eq!(
+            remove_page_numbers("- a\n5\n\\---\nNext", true),
+            "- a\n\\---\nNext"
+        );
+        assert_eq!(
+            remove_page_numbers("- a\n5\n---\nNext", false),
+            "- a\n---\nNext"
+        );
     }
 
     // --- format_urls ---
 
     #[test]
     fn test_format_urls_bare_url() {
-        let result = format_urls("Visit https://example.com for info");
+        let result = format_urls("Visit https://example.com for info", false);
         assert!(result.contains("[https://example.com](https://example.com)"));
     }
 
     #[test]
     fn test_format_urls_already_linked() {
         let input = "[click](https://example.com)";
-        assert_eq!(format_urls(input), input);
+        assert_eq!(format_urls(input, false), input);
     }
 
     #[test]
     fn test_format_urls_inside_brackets() {
         let input = "[https://example.com](https://example.com)";
-        let result = format_urls(input);
+        let result = format_urls(input, false);
         assert!(!result.contains("[["));
     }
 
     #[test]
     fn test_format_urls_multiple() {
         let input = "See https://a.com and https://b.com";
-        let result = format_urls(input);
+        let result = format_urls(input, false);
         assert!(result.contains("[https://a.com](https://a.com)"));
         assert!(result.contains("[https://b.com](https://b.com)"));
     }
@@ -946,6 +983,29 @@ mod tests {
     #[test]
     fn test_format_urls_no_urls() {
         let input = "No links here";
-        assert_eq!(format_urls(input), input);
+        assert_eq!(format_urls(input, false), input);
+    }
+
+    #[test]
+    fn escaped_brackets_decide_linking_as_unescaped_ones_do() {
+        let input = r"\[x https://example.com";
+        assert_eq!(format_urls(input, true), input);
+        assert_eq!(format_urls(&input[1..], false), &input[1..]);
+        let fenced = "```\n\\[ https://example.com\n```";
+        assert_eq!(format_urls(fenced, true), format_urls(fenced, false));
+        assert_eq!(
+            format_urls(r"\[x\] https://example.com", true),
+            r"\[x\] [https://example.com](https://example.com)"
+        );
+    }
+
+    #[test]
+    fn escaped_url_does_not_end_on_the_escaping_backslash() {
+        assert_eq!(
+            format_urls(r"\<https://example.com\>", true),
+            r"\<[https://example.com](https://example.com)\>"
+        );
+        let fenced = "```\nget https://example.com/a\\\n```";
+        assert_eq!(format_urls(fenced, true), format_urls(fenced, false));
     }
 }

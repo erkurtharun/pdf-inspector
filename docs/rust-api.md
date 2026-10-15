@@ -582,7 +582,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PositionOptions` | Options of the `_with_options` position and region functions: `frame` (a `PositionFrame`), `bold_from_weight`, which also reads `TextItem::is_bold` from a `font_weight` at or above `bold_weight_threshold` (600 by default, valid 100..=900) and merges adjacent runs by that verdict rather than by their weight classes; off by default, where `is_bold` and merging are unchanged |
 | `BoldSource` | Where `TextItem::is_bold` came from: `FontName`, `FontFlags`, `WeightClass` (with `bold_from_weight`) or `Painted`; the first of them in that order when more than one says bold |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
-| `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
+| `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.); `escape_text`, off by default and Rust only (not in the Python, Node.js or WebAssembly bindings), backslash-escapes source text that Markdown would read as syntax, leaving the converter's own markup and code blocks as they are |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |

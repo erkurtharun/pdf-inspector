@@ -1,5 +1,6 @@
 //! Core line-to-markdown conversion loop with table/image interleaving.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +12,11 @@ use super::analysis::{
     detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment,
     is_leader_continuation, is_toc_entry_line, is_toc_marker_heading, trailing_leader_dots,
 };
-use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
+use super::classify::{
+    format_escaped_list_item, format_list_item, is_caption_line, is_list_item,
+    starts_with_bullet_marker,
+};
+use super::escape::{escape_block_start, escape_closing_hashes, escape_inline};
 use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
@@ -843,13 +848,17 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut last_list_x: Option<f32> = None;
     // Code lines accumulate here and the fence is emitted only when the
     // block flushes with content — an empty ``` ``` pair can never appear.
-    fn flush_code_block(output: &mut String, pending_code: &mut String) {
+    fn flush_code_block(output: &mut String, pending_code: &mut String, escape_text: bool) {
         let trimmed = pending_code.trim();
         // A fragment too short to be code — a lone ® or stray glyph set in
         // a mono face — reads better as plain text than as a fenced block.
         if trimmed.chars().count() < 3 {
             if !trimmed.is_empty() {
-                output.push_str(trimmed);
+                if escape_text {
+                    output.push_str(&escape_block_start(&escape_inline(trimmed)));
+                } else {
+                    output.push_str(trimmed);
+                }
                 output.push_str("\n\n");
             }
         } else {
@@ -895,7 +904,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             // Flush current page's remaining tables and images
             if current_page > 0 {
                 if in_code_block {
-                    flush_code_block(&mut output, &mut pending_code);
+                    flush_code_block(&mut output, &mut pending_code, options.escape_text);
                     in_code_block = false;
                 }
                 flush_page_tables_and_images(
@@ -962,7 +971,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     // precedes it in reading order. A code line after the
                     // block reopens a new fence naturally.
                     if in_code_block {
-                        flush_code_block(&mut output, &mut pending_code);
+                        flush_code_block(&mut output, &mut pending_code, options.escape_text);
                         in_code_block = false;
                     }
                     if in_paragraph {
@@ -1017,10 +1026,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         prev_x = line_x;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(
+        let text = line.markdown_text(
             options.detect_bold,
             options.detect_italic,
             options.detect_underline,
+            options.escape_text,
         );
         let trimmed = text.trim();
 
@@ -1071,7 +1081,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
         // Close code block when transitioning to non-code
         if in_code_block && !is_code_line {
-            flush_code_block(&mut output, &mut pending_code);
+            flush_code_block(&mut output, &mut pending_code, options.escape_text);
             in_code_block = false;
         }
 
@@ -1085,7 +1095,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            output.push_str(trimmed);
+            output.push_str(&line_start(trimmed, options.escape_text));
             output.push_str("\n\n");
             continue;
         }
@@ -1205,11 +1215,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             let prefix = "#".repeat(level);
             // Plain text for headers (no redundant bold/italic inside `#`),
             // but underline is preserved: `<u>` carries meaning `#` doesn't.
-            let heading_text = if options.detect_underline {
-                line.text_with_formatting(false, false, true)
-            } else {
-                plain_text.clone()
-            };
+            let heading_text = heading_line_text(line, &options);
             output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
             if is_toc_marker_heading(plain_trimmed) {
                 toc_suppress_page = Some(line.page);
@@ -1234,7 +1240,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            output.push_str(&format!("- {}", trimmed));
+            output.push_str(&format!("- {}", line_start(trimmed, options.escape_text)));
             output.push('\n');
             in_list = true;
             last_list_x = line.items.first().map(|i| i.x);
@@ -1248,7 +1254,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            let formatted = format_list_item(trimmed);
+            let formatted = if options.escape_text {
+                format_escaped_list_item(trimmed)
+            } else {
+                format_list_item(trimmed)
+            };
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -1295,7 +1305,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            output.push_str(&format!("> {}\n", trimmed));
+            output.push_str(&format!("> {}\n", line_start(trimmed, options.escape_text)));
             continue;
         }
 
@@ -1314,6 +1324,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
         // Regular text - join lines within same paragraph with space
         let cur_dot_leaders = has_dot_leaders(plain_trimmed);
+        let starts_line = !in_paragraph || cur_dot_leaders || prev_had_dot_leaders;
         if in_paragraph {
             if cur_dot_leaders || prev_had_dot_leaders {
                 output.push('\n');
@@ -1321,7 +1332,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 output.push(' ');
             }
         }
-        output.push_str(trimmed);
+        output.push_str(&line_start(trimmed, options.escape_text && starts_line));
         paragraph_in_wrapped_bold_run = if in_paragraph {
             paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
         } else {
@@ -1333,7 +1344,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
     // Close any trailing code block
     if in_code_block {
-        flush_code_block(&mut output, &mut pending_code);
+        flush_code_block(&mut output, &mut pending_code, options.escape_text);
     }
 
     // Flush current page and any remaining pages with tables/images
@@ -1367,6 +1378,28 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
     // Clean up and post-process
     clean_markdown(output, &options)
+}
+
+/// `text` at the start of a Markdown line, escaped against block syntax
+/// when `escape` is set.
+fn line_start(text: &str, escape: bool) -> Cow<'_, str> {
+    if escape {
+        escape_block_start(text)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// A heading line's text after its `#` prefix: plain, except underline,
+/// and escaped, closing `#` run included, under `escape_text`.
+fn heading_line_text(line: &TextLine, options: &MarkdownOptions) -> String {
+    let text = line.markdown_text(false, false, options.detect_underline, options.escape_text);
+    let text = text.trim();
+    if options.escape_text {
+        escape_closing_hashes(text).into_owned()
+    } else {
+        text.to_string()
+    }
 }
 
 /// Convert text lines to markdown
@@ -1526,10 +1559,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         prev_y = line.y;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(
+        let text = line.markdown_text(
             options.detect_bold,
             options.detect_italic,
             options.detect_underline,
+            options.escape_text,
         );
         let trimmed = text.trim();
 
@@ -1566,7 +1600,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            output.push_str(trimmed);
+            output.push_str(&line_start(trimmed, options.escape_text));
             output.push_str("\n\n");
             continue;
         }
@@ -1624,11 +1658,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 }
                 let prefix = "#".repeat(header_level);
                 // Plain text for headers, except underline (see above).
-                let heading_text = if options.detect_underline {
-                    line.text_with_formatting(false, false, true)
-                } else {
-                    plain_text.clone()
-                };
+                let heading_text = heading_line_text(line, &options);
                 output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
                 if is_toc_marker_heading(plain_trimmed) {
                     toc_suppress_page = Some(line.page);
@@ -1645,7 +1675,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            let formatted = format_list_item(trimmed);
+            let formatted = if options.escape_text {
+                format_escaped_list_item(trimmed)
+            } else {
+                format_list_item(trimmed)
+            };
             output.push_str(&formatted);
             output.push('\n');
             in_list = true;
@@ -1692,6 +1726,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
         // Regular text - join lines within same paragraph with space
         let cur_dot_leaders = has_dot_leaders(plain_trimmed);
+        let starts_line = !in_paragraph || cur_dot_leaders || prev_had_dot_leaders;
         if in_paragraph {
             if cur_dot_leaders || prev_had_dot_leaders {
                 output.push('\n');
@@ -1699,7 +1734,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 output.push(' ');
             }
         }
-        output.push_str(trimmed);
+        output.push_str(&line_start(trimmed, options.escape_text && starts_line));
         paragraph_in_wrapped_bold_run = if in_paragraph {
             paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
         } else {
@@ -2148,6 +2183,162 @@ mod tests {
             md.contains("```\nfn main() {}\n```"),
             "Should format as code block: {md}"
         );
+    }
+
+    #[test]
+    fn escaped_short_code_fragment_opens_no_block() {
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::Code);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+        let convert = |text: &str, escape_text: bool| {
+            to_markdown_from_lines_with_tables_and_images(
+                vec![make_line(vec![make_item(text, 1, Some(0))])],
+                MarkdownOptions {
+                    escape_text,
+                    ..MarkdownOptions::default()
+                },
+                HashMap::new(),
+                HashMap::new(),
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+                Some(&roles),
+            )
+        };
+
+        for (text, escaped) in [("#", r"\#"), ("=", r"\="), ("<x", r"\<x")] {
+            assert_eq!(convert(text, true).trim(), escaped);
+            assert_eq!(convert(text, false).trim(), text);
+        }
+    }
+
+    #[test]
+    fn escaped_line_break_inside_a_run_opens_no_block() {
+        let convert = |escape_text: bool| {
+            to_markdown_from_lines_with_tables_and_images(
+                vec![make_line(vec![make_item(
+                    "intro\n# title\n  1. item",
+                    1,
+                    None,
+                )])],
+                MarkdownOptions {
+                    escape_text,
+                    ..MarkdownOptions::default()
+                },
+                HashMap::new(),
+                HashMap::new(),
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+                None,
+            )
+        };
+
+        let escaped = convert(true);
+        assert!(
+            escaped.contains("intro\n\\# title\n  1\\. item"),
+            "{escaped}"
+        );
+        let plain = convert(false);
+        assert!(plain.contains("intro\n# title\n  1. item"), "{plain}");
+    }
+
+    #[test]
+    fn escaped_marker_split_across_runs_after_a_line_break_opens_no_block() {
+        let mut first = make_item("intro\n1", 1, None);
+        first.width = 30.0;
+        let mut second = make_item(". item", 1, None);
+        second.x = first.x + first.width;
+        let convert = |escape_text: bool| {
+            to_markdown_from_lines_with_tables_and_images(
+                vec![make_line(vec![first.clone(), second.clone()])],
+                MarkdownOptions {
+                    escape_text,
+                    ..MarkdownOptions::default()
+                },
+                HashMap::new(),
+                HashMap::new(),
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+                None,
+            )
+        };
+
+        let escaped = convert(true);
+        assert!(escaped.contains("intro\n1\\. item"), "{escaped}");
+        let plain = convert(false);
+        assert!(plain.contains("intro\n1. item"), "{plain}");
+    }
+
+    #[test]
+    fn escaped_struct_role_lines_open_no_block() {
+        let line = |text: &str, mcid: i64| {
+            let mut item = make_item(text, 1, Some(mcid));
+            item.y = 700.0 - 60.0 * mcid as f32;
+            make_line(vec![item])
+        };
+        let lines = vec![
+            line("# quote", 0),
+            line("# caption", 1),
+            line("# item", 2),
+            line("Section ##", 3),
+        ];
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::BlockQuote);
+        page_roles.insert(1i64, StructRole::Caption);
+        page_roles.insert(2i64, StructRole::LI);
+        page_roles.insert(3i64, StructRole::H2);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+        let convert = |escape_text: bool| {
+            to_markdown_from_lines_with_tables_and_images(
+                lines.clone(),
+                MarkdownOptions {
+                    escape_text,
+                    ..MarkdownOptions::default()
+                },
+                HashMap::new(),
+                HashMap::new(),
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+                Some(&roles),
+            )
+        };
+
+        let escaped = convert(true);
+        for block in [
+            "> \\# quote\n",
+            "\n\\# caption\n",
+            "- \\# item\n",
+            "## Section \\##\n",
+        ] {
+            assert!(escaped.contains(block), "{block:?} in {escaped}");
+        }
+        let plain = convert(false);
+        for block in [
+            "> # quote\n",
+            "\n# caption\n",
+            "- # item\n",
+            "## Section ##\n",
+        ] {
+            assert!(plain.contains(block), "{block:?} in {plain}");
+        }
+    }
+
+    #[test]
+    fn escaped_plain_text_lines_open_no_block() {
+        let lines = vec![line_at("# 3 items", 1, 700.0), line_at("a_b *c*", 1, 686.0)];
+        let convert = |escape_text: bool| {
+            to_markdown_from_lines(
+                lines.clone(),
+                MarkdownOptions {
+                    escape_text,
+                    ..MarkdownOptions::default()
+                },
+            )
+        };
+
+        assert_eq!(convert(true).trim(), r"\# 3 items a\_b \*c\*");
+        assert_eq!(convert(false).trim(), "# 3 items a_b *c*");
     }
 
     #[test]

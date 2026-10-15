@@ -1,5 +1,7 @@
 //! Line classification: captions, lists, code detection.
 
+use super::escape::escape_block_start;
+
 /// Check if text is a figure/table caption or source citation
 pub(crate) fn is_caption_line(text: &str) -> bool {
     let trimmed = text.trim();
@@ -152,6 +154,30 @@ pub(crate) fn format_list_item(text: &str) -> String {
     trimmed.to_string()
 }
 
+/// Format a list item from escaped text: a bullet becomes `- ` (a `*`
+/// bullet arrives escaped), an `N.` or `N)` marker is kept, and the body is
+/// escaped against block syntax. Text without a Markdown list marker, such
+/// as `a.` or `(1)`, is escaped as a whole.
+pub(crate) fn format_escaped_list_item(text: &str) -> String {
+    let mut formatted = format_list_item(text);
+    if let Some(body) = formatted.strip_prefix("\\* ") {
+        formatted = format!("- {body}");
+    }
+    let digits = formatted.bytes().take_while(u8::is_ascii_digit).count();
+    let marker = match formatted[digits..].chars().next() {
+        Some('-') if digits == 0 => 1,
+        Some('.' | ')') if (1..=9).contains(&digits) => digits + 1,
+        _ => 0,
+    };
+    let rest = &formatted[marker..];
+    let body = rest.trim_start();
+    if marker == 0 || (body.len() == rest.len() && !body.is_empty()) {
+        return escape_block_start(&formatted).into_owned();
+    }
+    let head = &formatted[..formatted.len() - body.len()];
+    format!("{head}{}", escape_block_start(body))
+}
+
 /// Check if text looks like code
 pub(crate) fn is_code_like(text: &str) -> bool {
     let trimmed = text.trim();
@@ -301,6 +327,18 @@ mod tests {
             "- **Label:** rest of line"
         );
         assert_eq!(format_list_item("*● Italic:* rest"), "- *Italic:* rest");
+    }
+
+    #[test]
+    fn escaped_list_items_keep_their_marker_and_escape_their_body() {
+        assert_eq!(format_escaped_list_item("● - x"), r"- \- x");
+        assert_eq!(format_escaped_list_item(r"\* item"), "- item");
+        assert_eq!(format_escaped_list_item("- # x"), r"- \# x");
+        assert_eq!(format_escaped_list_item("1. Scope"), "1. Scope");
+        assert_eq!(format_escaped_list_item("12) > x"), r"12) \> x");
+        assert_eq!(format_escaped_list_item("3."), "3.");
+        assert_eq!(format_escaped_list_item("1.5 million"), "1.5 million");
+        assert_eq!(format_escaped_list_item("a. # x"), "a. # x");
     }
 
     #[test]

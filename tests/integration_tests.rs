@@ -655,6 +655,120 @@ fn test_markdown_options_custom() {
     assert!(!opts.include_links);
 }
 
+/// With `escape_text`, source text that Markdown would read as a heading,
+/// list, emphasis, link, HTML, entity, pipe or strikethrough is
+/// backslash-escaped, while the heading, list and bold markup the converter
+/// writes stays. By default the text is written as it is.
+#[test]
+fn test_escape_text_escapes_source_syntax_and_keeps_converter_markup() {
+    let content = r"BT /F1 24 Tf 72 740 Td (Rates of a_b *c*) Tj ET
+BT /F1 12 Tf 72 700 Td (# 3 items) Tj ET
+BT /F1 12 Tf 72 686 Td (were listed in the order) Tj ET
+BT /F1 12 Tf 72 672 Td (they arrived.) Tj ET
+BT /F1 12 Tf 72 642 Td (a *b* c_d [e]\(f\) <u>g</u> & h|i ~j~) Tj ET
+BT /F1 12 Tf 72 628 Td (ends the second) Tj ET
+BT /F1 12 Tf 72 614 Td (paragraph.) Tj ET
+0.3 w BT /F1 12 Tf 72 584 Td 2 Tr (Bold) Tj 0 Tr ( opens the third) Tj ET
+BT /F1 12 Tf 72 570 Td (paragraph, which) Tj ET
+BT /F1 12 Tf 72 556 Td (ends here.) Tj ET
+BT /F1 12 Tf 72 526 Td (1. Scope) Tj ET";
+    let pdf = make_text_pdf(content, "0 0 612 792");
+    let convert = |markdown: MarkdownOptions| {
+        process_pdf_mem_with_options(&pdf, PdfOptions::new().markdown(markdown))
+            .unwrap()
+            .markdown
+            .unwrap()
+    };
+
+    let escaped = convert(MarkdownOptions {
+        escape_text: true,
+        ..MarkdownOptions::default()
+    });
+    assert_eq!(
+        escaped,
+        r"# Rates of a\_b \*c\*
+
+\# 3 items were listed in the order they arrived.
+
+a \*b\* c\_d \[e\](f) \<u\>g\</u\> \& h\|i \~j\~ ends the second paragraph.
+
+**Bold** opens the third paragraph, which ends here.
+
+1. Scope
+"
+    );
+
+    let plain = convert(MarkdownOptions::default());
+    assert_eq!(
+        plain,
+        "# Rates of a_b *c*
+
+# 3 items were listed in the order they arrived.
+
+a *b* c_d [e](f) <u>g</u> & h|i ~j~ ends the second paragraph.
+
+**Bold** opens the third paragraph, which ends here.
+
+1. Scope
+"
+    );
+}
+
+/// The escapes `escape_text` adds are not judged as text: a form page whose
+/// blanks are runs of underscores, alone or followed by a scan, and a page
+/// too short to have been extracted in full are classified, routed to OCR
+/// and given Markdown exactly as without the option.
+#[test]
+fn test_escape_text_keeps_the_text_quality_verdict() {
+    let content = "BT /F1 12 Tf 72 700 Td (Name ______________________________) Tj ET
+BT /F1 12 Tf 72 680 Td (Date ______________________________) Tj ET
+BT /F1 12 Tf 72 660 Td (Signature _________________________) Tj ET";
+    let form = make_text_pdf(content, "0 0 612 792");
+    let short = make_text_pdf(
+        "BT /F1 12 Tf 72 700 Td (a_b c_d e_f g_h i_j k_l m_n o_p q_r s_t) Tj ET",
+        "0 0 612 792",
+    );
+    let form_and_scan = make_pdf_with_glyph_layer(&[
+        GlyphLayerPage {
+            covering_image: false,
+            layer_mode: None,
+            caption: Some(
+                "Name ______________________________________________________________________",
+            ),
+            body_lines: 3,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        },
+        GlyphLayerPage {
+            layer_mode: None,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        },
+    ]);
+    let process = |pdf: &[u8], escape_text: bool| {
+        process_pdf_mem_with_options(
+            pdf,
+            PdfOptions::new().markdown(MarkdownOptions {
+                escape_text,
+                ..MarkdownOptions::default()
+            }),
+        )
+        .unwrap()
+    };
+
+    for (pdf, pdf_type) in [
+        (&form, PdfType::TextBased),
+        (&short, PdfType::TextBased),
+        (&form_and_scan, PdfType::Mixed),
+    ] {
+        let plain = process(pdf, false);
+        let escaped = process(pdf, true);
+        assert_eq!(plain.pdf_type, pdf_type);
+        assert!(plain.markdown.is_some());
+        assert_eq!(escaped.pdf_type, plain.pdf_type);
+        assert_eq!(escaped.pages_needing_ocr, plain.pages_needing_ocr);
+        assert_eq!(escaped.markdown.is_some(), plain.markdown.is_some());
+    }
+}
+
 // ============================================================================
 // Markdown Conversion Tests
 // ============================================================================

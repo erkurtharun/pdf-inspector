@@ -9,6 +9,18 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Added
+
+- The Rust-only `MarkdownOptions::escape_text` (the Python, Node and
+  WebAssembly bindings do not expose it), off by default, backslash-escapes
+  source text that Markdown would read as syntax: backslashes, backticks,
+  `*`, `_`, `[`, `]`, `<`, `>`, `&`, `|` and `~` in each run and table cell
+  (bar a literal `<sup>` or `<sub>` in a cell), and a heading, quote, list
+  or setext marker at the start of a line, so a PDF line reading `# 3`,
+  `*note*` or `<u>x</u>` stays text once the output is parsed. Markup the
+  converter writes and code blocks are left as they are, and text quality,
+  and with it OCR routing, is judged as without the option.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that
