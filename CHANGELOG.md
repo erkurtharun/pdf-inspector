@@ -9,6 +9,11 @@ version and date. Earlier releases are described in their
 
 ## [Unreleased]
 
+### Changed
+
+- Markdown conversion no longer reads `PI_NO_MERGE` from the environment,
+  so wrapped bold headings are merged the same way in every process.
+
 ### Fixed
 
 - A TrueType subset with no `cmap`, no glyph names and no ToUnicode that

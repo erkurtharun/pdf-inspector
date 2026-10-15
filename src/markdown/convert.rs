@@ -789,11 +789,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // and after) is one heading that wrapped. Left split, the internal line
     // gap breaks each line's isolation and neither classifies as a heading —
     // the whole group then merges into the following body paragraph.
-    let lines = if std::env::var("PI_NO_MERGE").is_ok() {
-        lines
-    } else {
-        merge_wrapped_bold_heading_groups(lines, base_size, para_threshold)
-    };
+    let lines = merge_wrapped_bold_heading_groups(lines, base_size, para_threshold);
 
     // Pre-scan: identify isolated lines (paragraph break before AND after).
     // These are heading candidates even without bold/large font — common in
